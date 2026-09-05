@@ -457,7 +457,7 @@ jobs:
       - name: 🧪 Run smoke tests (Electron)
         if: ${{ inputs.electron_tests && inputs.smoke_tests }}
         timeout-minutes: 20
-        run: npm run smoketest-no-compile -- --tracing
+        run: bash test/smoke/scripts/run-with-policy.sh --tracing
         env:
           DISPLAY: ":10"
 
