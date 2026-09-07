@@ -123,6 +123,19 @@ class ResolveFailingProvider extends InMemoryFileSystemProvider {
 	}
 }
 
+class CrossRootConflictProvider extends InMemoryFileSystemProvider {
+	triggerUri: URI | undefined;
+	conflictingUri: URI | undefined;
+
+	override async writeFile(resource: URI, content: Uint8Array, options: IFileWriteOptions): Promise<void> {
+		await super.writeFile(resource, content, options);
+		if (this.triggerUri && this.conflictingUri && isEqual(resource, this.triggerUri)) {
+			this.triggerUri = undefined;
+			await super.writeFile(this.conflictingUri, VSBuffer.fromString('{"mcpServers":{"demo":{"command":"other"}}}').buffer, options);
+		}
+	}
+}
+
 suite('McpServerCustomizationMigration', () => {
 	const store = ensureNoDisposablesAreLeakedInTestSuite();
 
@@ -529,4 +542,153 @@ suite('McpServerCustomizationMigration', () => {
 		assert.deepStrictEqual(result.failures.map(failure => failure.reason), [McpServerCustomizationMigrationFailureReason.NoLongerEligible]);
 		assert.strictEqual(await fileService.exists(targetUri), false);
 	});
+
+	for (const location of ['destination', 'source'] as const) {
+		test(`rejects and logs a server name already present in another root's ${location}`, async () => {
+			const primary = URI.file('/primary');
+			const secondary = URI.file('/secondary');
+			const selected = candidate(secondary, 'demo');
+			const conflictingUri = location === 'destination'
+				? URI.joinPath(primary, '.mcp.json')
+				: URI.joinPath(primary, '.vscode', 'mcp.json');
+			const fileService = createFileService();
+			const sourceContent = '{"servers":{"demo":{"command":"node"}}}';
+			const conflictingContent = location === 'destination'
+				? '{"mcpServers":{"demo":{"command":"other"}}}'
+				: '{"servers":{"demo":{"command":"other"}}}';
+			await fileService.writeFile(selected.sourceUri, VSBuffer.fromString(sourceContent));
+			await fileService.writeFile(conflictingUri, VSBuffer.fromString(conflictingContent));
+			const warnings: string[] = [];
+			const logService = new class extends NullLogService {
+				override warn(message: string): void { warnings.push(message); }
+			}();
+
+			const result = await new McpServerCustomizationMigrator(fileService, logService).migrate([selected], { roots: [primary, secondary] });
+
+			assert.deepStrictEqual({
+				migratedCount: result.migratedCount,
+				failures: result.failures.map(failure => ({ name: failure.name, reason: failure.reason, conflictingUri: failure.conflictingUri?.toString() })),
+				source: (await fileService.readFile(selected.sourceUri)).value.toString(),
+				conflict: (await fileService.readFile(conflictingUri)).value.toString(),
+				targetExists: await fileService.exists(selected.targetUri),
+				warnings,
+			}, {
+				migratedCount: 0,
+				failures: [{ name: 'demo', reason: McpServerCustomizationMigrationFailureReason.CrossRootConflict, conflictingUri: conflictingUri.toString() }],
+				source: sourceContent,
+				conflict: conflictingContent,
+				targetExists: false,
+				warnings: [`[MCP Customization Migration] Rejected 'demo' from ${selected.sourceUri.toString()}: reason=crossRootConflict, conflictingUri=${conflictingUri.toString()}`],
+			});
+		});
+	}
+
+	test('rejects all same-name selections across roots while migrating unrelated servers', async () => {
+		const primary = URI.file('/primary');
+		const secondary = URI.file('/secondary');
+		const first = candidate(primary, 'demo');
+		const second = candidate(secondary, 'demo');
+		const unique = candidate(primary, 'unique');
+		const fileService = createFileService();
+		await fileService.writeFile(first.sourceUri, VSBuffer.fromString('{"servers":{"demo":{"command":"node"},"unique":{"command":"node"}}}'));
+		await fileService.writeFile(second.sourceUri, VSBuffer.fromString('{"servers":{"demo":{"command":"node"}}}'));
+
+		const warnings: string[] = [];
+		const logService = new class extends NullLogService {
+			override warn(message: string): void { warnings.push(message); }
+		}();
+		const result = await new McpServerCustomizationMigrator(fileService, logService).migrate([first, second, unique], { roots: [primary, secondary] });
+
+		assert.deepStrictEqual({
+			migratedCount: result.migratedCount,
+			failures: result.failures.map(failure => [failure.sourceUri.toString(), failure.reason, failure.conflictingUri?.toString()]),
+			primarySource: parse((await fileService.readFile(first.sourceUri)).value.toString()),
+			secondarySource: parse((await fileService.readFile(second.sourceUri)).value.toString()),
+			primaryTarget: parse((await fileService.readFile(first.targetUri)).value.toString()),
+			secondaryTargetExists: await fileService.exists(second.targetUri),
+			warnings,
+		}, {
+			migratedCount: 1,
+			failures: [
+				[first.sourceUri.toString(), McpServerCustomizationMigrationFailureReason.CrossRootConflict, second.sourceUri.toString()],
+				[second.sourceUri.toString(), McpServerCustomizationMigrationFailureReason.CrossRootConflict, first.sourceUri.toString()],
+			],
+			primarySource: { servers: { demo: { command: 'node' } } },
+			secondarySource: { servers: { demo: { command: 'node' } } },
+			primaryTarget: { mcpServers: { unique: { type: 'stdio', command: 'node' } } },
+			secondaryTargetExists: false,
+			warnings: [
+				`[MCP Customization Migration] Rejected 'demo' from ${first.sourceUri.toString()}: reason=crossRootConflict, conflictingUri=${second.sourceUri.toString()}`,
+				`[MCP Customization Migration] Rejected 'demo' from ${second.sourceUri.toString()}: reason=crossRootConflict, conflictingUri=${first.sourceUri.toString()}`,
+			],
+		});
+	});
+
+	test('does not count a cross-root rejection again when another candidate fails to write', async () => {
+		const primary = URI.file('/primary');
+		const secondary = URI.file('/secondary');
+		const duplicate = candidate(primary, 'demo');
+		const unique = candidate(primary, 'unique');
+		const conflictingUri = URI.joinPath(secondary, '.vscode', 'mcp.json');
+		const provider = new SourceWriteFailingProvider();
+		const fileService = createFileService(provider);
+		const sourceContent = '{"servers":{"demo":{"command":"node"},"unique":{"command":"node"}}}';
+		const targetContent = '{"mcpServers":{}}';
+		await fileService.writeFile(duplicate.sourceUri, VSBuffer.fromString(sourceContent));
+		await fileService.writeFile(duplicate.targetUri, VSBuffer.fromString(targetContent));
+		await fileService.writeFile(conflictingUri, VSBuffer.fromString('{"servers":{"demo":{"command":"other"}}}'));
+		provider.sourceUri = duplicate.sourceUri;
+		provider.failSourceWrite = true;
+
+		const result = await createMigrator(fileService).migrate([duplicate, unique], { roots: [primary, secondary] });
+
+		assert.deepStrictEqual({
+			migratedCount: result.migratedCount,
+			failures: result.failures.map(failure => [failure.name, failure.reason]),
+			source: (await fileService.readFile(duplicate.sourceUri)).value.toString(),
+			target: (await fileService.readFile(duplicate.targetUri)).value.toString(),
+		}, {
+			migratedCount: 0,
+			failures: [
+				['demo', McpServerCustomizationMigrationFailureReason.CrossRootConflict],
+				['unique', McpServerCustomizationMigrationFailureReason.WriteFailed],
+			],
+			source: sourceContent,
+			target: targetContent,
+		});
+	});
+
+	for (const phase of ['target', 'source'] as const) {
+		test(`rolls back when a cross-root name conflict appears during the ${phase} write`, async () => {
+			const primary = URI.file('/primary');
+			const secondary = URI.file('/secondary');
+			const selected = candidate(secondary, 'demo');
+			const conflictingUri = URI.joinPath(primary, '.mcp.json');
+			const provider = new CrossRootConflictProvider();
+			const fileService = createFileService(provider);
+			const sourceContent = '{"servers":{"demo":{"command":"node"}}}';
+			const targetContent = '{"mcpServers":{}}';
+			await fileService.writeFile(selected.sourceUri, VSBuffer.fromString(sourceContent));
+			await fileService.writeFile(selected.targetUri, VSBuffer.fromString(targetContent));
+			await fileService.writeFile(conflictingUri, VSBuffer.fromString(targetContent));
+			provider.triggerUri = phase === 'target' ? selected.targetUri : selected.sourceUri;
+			provider.conflictingUri = conflictingUri;
+
+			const result = await createMigrator(fileService).migrate([selected], { roots: [primary, secondary] });
+
+			assert.deepStrictEqual({
+				migratedCount: result.migratedCount,
+				failures: result.failures.map(failure => [failure.reason, failure.conflictingUri?.toString()]),
+				source: (await fileService.readFile(selected.sourceUri)).value.toString(),
+				target: (await fileService.readFile(selected.targetUri)).value.toString(),
+				conflict: parse((await fileService.readFile(conflictingUri)).value.toString()),
+			}, {
+				migratedCount: 0,
+				failures: [[McpServerCustomizationMigrationFailureReason.CrossRootConflict, conflictingUri.toString()]],
+				source: sourceContent,
+				target: targetContent,
+				conflict: { mcpServers: { demo: { command: 'other' } } },
+			});
+		});
+	}
 });

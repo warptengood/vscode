@@ -782,19 +782,21 @@ async function renderEditor(ctx: ComponentFixtureContext, options: IRenderEditor
 			const harnessService = createMockHarnessService(options.sessionResource, availableHarnesses);
 			const agentFeedbackService = createMockAgentFeedbackService();
 			const codeReviewService = createMockCodeReviewService();
-			registerWorkbenchServices(reg);
-			// Enable the structured customization preview setting so the
-			// editor exercises the preview-first behavior in fixtures.
-			// Also enable customization migration so migration affordances render in
-			// screenshot fixtures that depend on agent-host harnesses.
-			reg.defineInstance(IConfigurationService, new TestConfigurationService({
+			const configurationService = new TestConfigurationService({
 				[ChatConfiguration.ChatCustomizationsStructuredPreviewEnabled]: true,
 				[ChatConfiguration.ChatCustomizationsPromptMigrationEnabled]: true,
 				[ChatConfiguration.ChatCustomizationsUserDataMigrationEnabled]: true,
 				[ChatConfiguration.ChatCustomizationsLocationsMigrationEnabled]: true,
 				[ChatConfiguration.ChatCustomizationsMcpServerMigrationEnabled]: true,
 				...options.configuration,
-			}));
+			});
+			ctx.disposableStore.add({ dispose: () => configurationService.onDidChangeConfigurationEmitter.dispose() });
+			registerWorkbenchServices(reg);
+			// Enable the structured customization preview setting so the
+			// editor exercises the preview-first behavior in fixtures.
+			// Also enable customization migration so migration affordances render in
+			// screenshot fixtures that depend on agent-host harnesses.
+			reg.defineInstance(IConfigurationService, configurationService);
 			reg.define(IListService, ListService);
 			reg.defineInstance(IMcpGalleryManifestService, createMockMcpGalleryManifestService());
 			reg.defineInstance(ITextModelService, new class extends mock<ITextModelService>() {
@@ -883,6 +885,7 @@ async function renderEditor(ctx: ComponentFixtureContext, options: IRenderEditor
 				agentHostCustomizationService,
 				migrationFileService,
 				new NullLogService(),
+				configurationService,
 			));
 			reg.defineInstance(IAICustomizationWorkspaceService, new class extends mock<IAICustomizationWorkspaceService>() {
 				override readonly isSessionsWindow = isSessionsWindow;

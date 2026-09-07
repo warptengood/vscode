@@ -190,6 +190,28 @@ suite('customizationMigration', () => {
 		});
 	});
 
+	test('explains cross-root MCP conflicts and prioritizes rollback guidance', () => {
+		const category = getCustomizationMigrationCategory(CustomizationMigrationCategoryId.McpServers);
+		const failure = {
+			id: 'demo',
+			name: 'demo',
+			sourceUri: URI.file('/secondary/.vscode/mcp.json'),
+			targetUri: URI.file('/secondary/.mcp.json'),
+			conflictingUri: URI.file('/primary/.mcp.json'),
+			reason: McpServerCustomizationMigrationFailureReason.CrossRootConflict,
+		};
+
+		assert.deepStrictEqual({
+			single: category.getMcpServerFailureMessage?.([failure]),
+			multiple: category.getMcpServerFailureMessage?.([failure, { ...failure, name: 'other' }]),
+			rollback: category.getMcpServerFailureMessage?.([failure, { ...failure, reason: McpServerCustomizationMigrationFailureReason.RollbackFailed }]),
+		}, {
+			single: 'Could not migrate \'demo\' because another workspace root defines an MCP server with the same name. Rename or remove the duplicate before migrating.',
+			multiple: 'Some MCP servers could not be migrated because their names conflict across workspace roots. Rename or remove the duplicates before migrating.',
+			rollback: 'Some MCP server migrations could not be safely completed or rolled back. Review the affected source and destination MCP configuration files.',
+		});
+	});
+
 
 	test('uses singular copy for one User Data customization', () => {
 		const category = getCustomizationMigrationCategory(CustomizationMigrationCategoryId.UserData);

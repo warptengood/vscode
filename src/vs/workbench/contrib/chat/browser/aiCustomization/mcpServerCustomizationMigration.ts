@@ -45,6 +45,7 @@ interface IMcpTargetDocument extends IJsonDocument {
 
 interface IMcpServerCustomizationMigrationExecutionOptions {
 	readonly isContextCurrent?: (candidates: readonly IMcpServerCustomizationMigrationCandidate[]) => boolean;
+	readonly roots?: readonly URI[];
 }
 
 /**
@@ -203,6 +204,16 @@ async function executeMigration(
 	}
 	logService.trace(`${LOG_PREFIX} Executing: candidates=${candidates.length}, groups=${groups.size}, rejected=${failures.length}`);
 
+	const roots = new ResourceMap<URI>();
+	for (const root of options.roots ?? []) {
+		roots.set(root, root);
+	}
+	const selectedCandidates = [...groups.values()].flatMap(group => group.candidates);
+	for (const group of groups.values()) {
+		const root = dirname(group.targetUri);
+		roots.set(root, root);
+	}
+	const workingDirectories = [...roots.values()];
 	let migratedCount = 0;
 	for (const group of groups.values()) {
 		if (options.isContextCurrent?.(group.candidates) === false) {
@@ -210,18 +221,82 @@ async function executeMigration(
 			failures.push(...group.candidates.map(candidate => createFailure(candidate, McpServerCustomizationMigrationFailureReason.NoLongerEligible)));
 			continue;
 		}
+		let eligibleCandidates = group.candidates;
 		try {
-			const result = await migrateGroup(group, fileService, logService, options);
+			const conflicts = await findCrossRootConflicts(group, workingDirectories, fileService);
+			eligibleCandidates = group.candidates.filter(candidate => {
+				const selectedConflict = selectedCandidates.find(other => other.name === candidate.name && !isEqual(other.targetUri, candidate.targetUri));
+				const conflictingUri = conflicts.get(candidate.name) ?? selectedConflict?.sourceUri;
+				if (!conflictingUri) {
+					return true;
+				}
+				logService.warn(`${LOG_PREFIX} Rejected '${candidate.name}' from ${candidate.sourceUri.toString()}: reason=${McpServerCustomizationMigrationFailureReason.CrossRootConflict}, conflictingUri=${conflictingUri.toString()}`);
+				failures.push({ ...createFailure(candidate, McpServerCustomizationMigrationFailureReason.CrossRootConflict), conflictingUri });
+				return false;
+			});
+			if (eligibleCandidates.length === 0) {
+				continue;
+			}
+			const result = await migrateGroup({ ...group, candidates: eligibleCandidates }, fileService, logService, options, workingDirectories);
 			migratedCount += result.migratedCount;
 			failures.push(...result.failures);
 		} catch (error) {
 			const migrationError = toMigrationError(error);
 			logService.trace(`${LOG_PREFIX} Group ${group.sourceUri.toString()} failed: reason=${migrationError.reason}`);
-			failures.push(...group.candidates.map(candidate => createFailure(candidate, migrationError.reason, migrationError)));
+			failures.push(...eligibleCandidates.map(candidate => createFailure(candidate, migrationError.reason, migrationError)));
 		}
 	}
 
 	return { migratedCount, failures };
+}
+
+async function findCrossRootConflicts(group: IMcpServerMigrationGroup, roots: readonly URI[], fileService: IFileService): Promise<Map<string, URI>> {
+	const conflicts = new Map<string, URI>();
+	for (const root of roots) {
+		const targetUri = URI.joinPath(root, '.mcp.json');
+		if (isEqual(targetUri, group.targetUri)) {
+			continue;
+		}
+		const sourceUri = URI.joinPath(root, '.vscode', 'mcp.json');
+		let target: IMcpTargetDocument;
+		try {
+			target = await readTargetDocument(targetUri, fileService);
+		} catch (error) {
+			throw new McpServerMigrationError(McpServerCustomizationMigrationFailureReason.InvalidTarget, toError(error));
+		}
+		let sourceServers: Record<string, unknown> | undefined;
+		try {
+			sourceServers = getObjectProperty((await readSourceDocument(sourceUri, fileService)).value, 'servers');
+		} catch (error) {
+			if (toFileOperationResult(error) !== FileOperationResult.FILE_NOT_FOUND) {
+				throw new McpServerMigrationError(McpServerCustomizationMigrationFailureReason.SourceUnavailable, toError(error));
+			}
+		}
+		const targetServers = getTargetServers(target);
+		for (const candidate of group.candidates) {
+			if (conflicts.has(candidate.name)) {
+				continue;
+			}
+			if (Object.hasOwn(targetServers, candidate.name)) {
+				conflicts.set(candidate.name, targetUri);
+			} else if (sourceServers && Object.hasOwn(sourceServers, candidate.name)) {
+				conflicts.set(candidate.name, sourceUri);
+			}
+		}
+	}
+	return conflicts;
+}
+
+async function ensureNoCrossRootConflicts(group: IMcpServerMigrationGroup, roots: readonly URI[], fileService: IFileService, logService: ILogService): Promise<void> {
+	const conflicts = await findCrossRootConflicts(group, roots, fileService);
+	for (const [name, conflictingUri] of conflicts) {
+		logService.warn(`${LOG_PREFIX} Cross-root conflict during migration of '${name}' from ${group.sourceUri.toString()}: conflictingUri=${conflictingUri.toString()}`);
+		throw new McpServerMigrationError(
+			McpServerCustomizationMigrationFailureReason.CrossRootConflict,
+			new Error(`MCP server '${name}' is also defined in ${conflictingUri.toString()}.`),
+			conflictingUri,
+		);
+	}
 }
 
 async function migrateGroup(
@@ -229,6 +304,7 @@ async function migrateGroup(
 	fileService: IFileService,
 	logService: ILogService,
 	options: IMcpServerCustomizationMigrationExecutionOptions,
+	roots: readonly URI[],
 ): Promise<IMcpServerCustomizationMigrationResult> {
 	logService.trace(`${LOG_PREFIX} Migrating ${group.candidates.length} server(s) from ${group.sourceUri.toString()} to ${group.targetUri.toString()}.`);
 	let source: IJsonDocument;
@@ -338,6 +414,19 @@ async function migrateGroup(
 		logService.trace(`${LOG_PREFIX} Target ${group.targetUri.toString()} already contains every selected entry.`);
 	}
 
+	try {
+		await ensureNoCrossRootConflicts({ ...group, candidates: candidatesToMigrate }, roots, fileService, logService);
+	} catch (error) {
+		if (writtenTarget) {
+			try {
+				await rollbackTarget(group.targetUri, target, writtenTarget, targetContent, fileService);
+			} catch (rollbackError) {
+				throw rollbackErrorWith(error, rollbackError, group.sourceUri);
+			}
+		}
+		throw error;
+	}
+
 	if (options.isContextCurrent?.(candidatesToMigrate) === false) {
 		logService.trace(`${LOG_PREFIX} Aborting ${group.sourceUri.toString()} after the target write: execution context changed.`);
 		if (writtenTarget) {
@@ -381,6 +470,7 @@ async function migrateGroup(
 
 	try {
 		await verifyMigration(group, candidatesToMigrate, fileService);
+		await ensureNoCrossRootConflicts({ ...group, candidates: candidatesToMigrate }, roots, fileService, logService);
 	} catch (verificationError) {
 		logService.trace(`${LOG_PREFIX} Verification failed for ${group.sourceUri.toString()}; rolling both files back.`);
 		const rollbackErrors: Error[] = [];
@@ -403,6 +493,9 @@ async function migrateGroup(
 				McpServerCustomizationMigrationFailureReason.RollbackFailed,
 				new AggregateError([toError(verificationError), ...rollbackErrors], `Failed to verify and roll back MCP servers from ${group.sourceUri.toString()}.`),
 			);
+		}
+		if (verificationError instanceof McpServerMigrationError) {
+			throw verificationError;
 		}
 		throw new McpServerMigrationError(McpServerCustomizationMigrationFailureReason.TargetChanged, toError(verificationError));
 	}
@@ -665,6 +758,7 @@ class McpServerMigrationError extends Error {
 	constructor(
 		readonly reason: McpServerCustomizationMigrationFailureReason,
 		readonly underlyingError: Error,
+		readonly conflictingUri?: URI,
 	) {
 		super(underlyingError.message);
 	}
@@ -694,5 +788,6 @@ function createFailure(
 		targetUri: candidate.targetUri,
 		reason,
 		error,
+		...(error instanceof McpServerMigrationError && error.conflictingUri ? { conflictingUri: error.conflictingUri } : {}),
 	};
 }

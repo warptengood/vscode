@@ -8,6 +8,7 @@ import { CancellationToken } from '../../../../../../base/common/cancellation.js
 import { getComparisonKey } from '../../../../../../base/common/resources.js';
 import { URI } from '../../../../../../base/common/uri.js';
 import { IMcpServerConfiguration } from '../../../../../../platform/mcp/common/mcpPlatformTypes.js';
+import { ChatConfiguration } from '../../constants.js';
 import { PromptFileSource, PromptsType } from '../promptTypes.js';
 import { PromptsStorage } from './promptsService.js';
 
@@ -18,6 +19,15 @@ export enum CustomizationMigrationType {
 	PromptFiles = 'promptFiles',
 	ConfiguredLocations = 'configuredLocations',
 	McpServers = 'mcpServers',
+}
+
+export function getCustomizationMigrationEnablementSetting(type: CustomizationMigrationType): ChatConfiguration {
+	switch (type) {
+		case CustomizationMigrationType.UserData: return ChatConfiguration.ChatCustomizationsUserDataMigrationEnabled;
+		case CustomizationMigrationType.PromptFiles: return ChatConfiguration.ChatCustomizationsPromptMigrationEnabled;
+		case CustomizationMigrationType.ConfiguredLocations: return ChatConfiguration.ChatCustomizationsLocationsMigrationEnabled;
+		case CustomizationMigrationType.McpServers: return ChatConfiguration.ChatCustomizationsMcpServerMigrationEnabled;
+	}
 }
 
 export interface MigratableConfiguration {
@@ -99,16 +109,29 @@ export interface McpServerCustomizationMigration {
 }
 
 export const enum McpServerCustomizationMigrationFailureReason {
+	/** The server or execution context no longer satisfies the migration requirements. */
 	NoLongerEligible = 'noLongerEligible',
+	/** A source configuration file is missing or could not be read. */
 	SourceUnavailable = 'sourceUnavailable',
+	/** The source JSON, servers map, or selected server definition is invalid. */
 	InvalidSource = 'invalidSource',
+	/** The configuration cannot be moved losslessly because of unsupported properties, unresolved variables, or projection differences. */
 	UnrepresentableConfiguration = 'unrepresentableConfiguration',
+	/** The source entry or file no longer matches what was validated for migration. */
 	SourceChanged = 'sourceChanged',
+	/** An existing destination cannot be read or parsed as a supported MCP configuration document. */
 	InvalidTarget = 'invalidTarget',
+	/** The destination already defines the same server name with a non-equivalent configuration. */
 	TargetConflict = 'targetConflict',
+	/** The server name is also defined or selected for migration in another workspace root. */
+	CrossRootConflict = 'crossRootConflict',
+	/** The destination changed before writing, or final source/target verification failed. */
 	TargetChanged = 'targetChanged',
+	/** A migration file operation failed without a more specific failure reason. */
 	WriteFailed = 'writeFailed',
+	/** Original file contents could not be safely restored; a newly created destination may be retained. */
 	RollbackFailed = 'rollbackFailed',
+	/** The source and destination are not a same-root .vscode/mcp.json to .mcp.json pair. */
 	InconsistentTarget = 'inconsistentTarget',
 }
 
@@ -118,6 +141,7 @@ export interface IMcpServerCustomizationMigrationFailure {
 	readonly sourceUri: URI;
 	readonly targetUri: URI;
 	readonly reason: McpServerCustomizationMigrationFailureReason;
+	readonly conflictingUri?: URI;
 	readonly error?: Error;
 }
 

@@ -12,7 +12,7 @@ import type { IConfigurationService } from '../../../../../platform/configuratio
 import { ChatConfiguration } from '../../common/constants.js';
 import { PromptsConfig } from '../../common/promptSyntax/config/config.js';
 import { PromptsType } from '../../common/promptSyntax/promptTypes.js';
-import { CustomizationMigrationCandidate, CustomizationMigrationType, IMcpServerCustomizationMigrationFailure, isConfiguredLocationMigrationCandidate, isMcpServerCustomizationMigrationCandidate, isPromptFileMigrationCandidate, isUserDataMigrationCandidate, McpServerCustomizationMigrationFailureReason, MigratableConfiguration } from '../../common/promptSyntax/service/customizationMigrationService.js';
+import { CustomizationMigrationCandidate, CustomizationMigrationType, getCustomizationMigrationEnablementSetting, IMcpServerCustomizationMigrationFailure, isConfiguredLocationMigrationCandidate, isMcpServerCustomizationMigrationCandidate, isPromptFileMigrationCandidate, isUserDataMigrationCandidate, McpServerCustomizationMigrationFailureReason, MigratableConfiguration } from '../../common/promptSyntax/service/customizationMigrationService.js';
 import { PromptsStorage } from '../../common/promptSyntax/service/promptsService.js';
 
 export const enum CustomizationMigrationCategoryId {
@@ -109,7 +109,7 @@ const promptFilesMigrationCategory: ICustomizationMigrationCategory = {
 	id: CustomizationMigrationCategoryId.PromptFiles,
 	migrationType: CustomizationMigrationType.PromptFiles,
 	sourceTypes: [PromptsType.prompt],
-	enablementSetting: ChatConfiguration.ChatCustomizationsPromptMigrationEnabled,
+	enablementSetting: getCustomizationMigrationEnablementSetting(CustomizationMigrationType.PromptFiles),
 	shortcutLabel: localize('promptMigrationShortcutLabel', "Migrate Prompts"),
 	shortcutTooltip: localize('promptMigrationShortcutTooltip', "Convert deprecated prompt files to skills"),
 	cardLabel: localize('promptMigrationCardLabel', "Migrate Prompt Files"),
@@ -248,7 +248,7 @@ const userDataMigrationCategory: ICustomizationMigrationCategory = {
 	id: CustomizationMigrationCategoryId.UserData,
 	migrationType: CustomizationMigrationType.UserData,
 	sourceTypes: [PromptsType.agent, PromptsType.instructions],
-	enablementSetting: ChatConfiguration.ChatCustomizationsUserDataMigrationEnabled,
+	enablementSetting: getCustomizationMigrationEnablementSetting(CustomizationMigrationType.UserData),
 	shortcutLabel: localize('userDataMigrationShortcutLabel', "Migrate User Data"),
 	shortcutTooltip: localize('userDataMigrationShortcutTooltip', "Move user data agents and instructions to the active harness"),
 	cardLabel: localize('userDataMigrationCardLabel', "Migrate User Data Customizations"),
@@ -424,7 +424,7 @@ const configuredLocationsMigrationCategory: ICustomizationMigrationCategory = {
 	id: CustomizationMigrationCategoryId.ConfiguredLocations,
 	migrationType: CustomizationMigrationType.ConfiguredLocations,
 	sourceTypes: [PromptsType.agent, PromptsType.instructions, PromptsType.skill],
-	enablementSetting: ChatConfiguration.ChatCustomizationsLocationsMigrationEnabled,
+	enablementSetting: getCustomizationMigrationEnablementSetting(CustomizationMigrationType.ConfiguredLocations),
 	configurationSettingIds: CONFIGURED_LOCATION_SETTING_IDS,
 	shortcutLabel: localize('configuredLocationsMigrationShortcutLabel', "Migrate Location Settings"),
 	shortcutTooltip: localize('configuredLocationsMigrationShortcutTooltip', "Move customizations from locations unsupported by the active harness"),
@@ -538,7 +538,7 @@ const configuredLocationsMigrationCategory: ICustomizationMigrationCategory = {
 const mcpServersMigrationCategory: ICustomizationMigrationCategory = {
 	id: CustomizationMigrationCategoryId.McpServers,
 	migrationType: CustomizationMigrationType.McpServers,
-	enablementSetting: ChatConfiguration.ChatCustomizationsMcpServerMigrationEnabled,
+	enablementSetting: getCustomizationMigrationEnablementSetting(CustomizationMigrationType.McpServers),
 	shortcutLabel: localize('mcpMigrationShortcutLabel', "Migrate MCP Servers"),
 	shortcutTooltip: localize('mcpMigrationShortcutTooltip', "Move supported workspace MCP servers to root .mcp.json files"),
 	cardLabel: localize('mcpMigrationCardLabel', "Migrate MCP Servers"),
@@ -628,6 +628,12 @@ const mcpServersMigrationCategory: ICustomizationMigrationCategory = {
 			return failures.length === 1
 				? localize('mcpMigrationRollbackFailed', "Could not safely complete or roll back the migration for '{0}'. Review both MCP configuration files.", failures[0].name)
 				: localize('mcpMigrationRollbackFailedMultiple', "Some MCP server migrations could not be safely completed or rolled back. Review the affected source and destination MCP configuration files.");
+		}
+		const crossRootConflicts = failures.filter(failure => failure.reason === McpServerCustomizationMigrationFailureReason.CrossRootConflict);
+		if (crossRootConflicts.length > 0) {
+			return failures.length === 1
+				? localize('mcpMigrationCrossRootConflict', "Could not migrate '{0}' because another workspace root defines an MCP server with the same name. Rename or remove the duplicate before migrating.", crossRootConflicts[0].name)
+				: localize('mcpMigrationCrossRootConflicts', "Some MCP servers could not be migrated because their names conflict across workspace roots. Rename or remove the duplicates before migrating.");
 		}
 		if (failures.length !== 1) {
 			const displayedFailures = failures.slice(0, 3);

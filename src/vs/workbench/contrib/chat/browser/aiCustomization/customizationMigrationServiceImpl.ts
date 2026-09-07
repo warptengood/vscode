@@ -11,13 +11,14 @@ import { equals } from '../../../../../base/common/objects.js';
 import { extUriBiasedIgnorePathCase, getComparisonKey, isEqual } from '../../../../../base/common/resources.js';
 import { URI } from '../../../../../base/common/uri.js';
 import { localize } from '../../../../../nls.js';
+import { IConfigurationService } from '../../../../../platform/configuration/common/configuration.js';
 import { IFileService } from '../../../../../platform/files/common/files.js';
 import { ILogService } from '../../../../../platform/log/common/log.js';
 import { isAgentHostSessionResource } from '../../common/chatSessionsService.js';
 import { ICustomizationHarnessService, ICustomizationSourceFolder } from '../../common/customizationHarnessService.js';
 import { getChatSessionType } from '../../common/model/chatUri.js';
 import { PromptsType } from '../../common/promptSyntax/promptTypes.js';
-import { CustomizationMigration, CustomizationMigrationHintTarget, CustomizationMigrationType, FileCustomizationMigration, FileCustomizationMigrationType, getCustomizationMigrationTargetType, getMcpServerCustomizationMigrationCandidateKey, ICustomizationMigrationHint, ICustomizationMigrationService, IMcpServerCustomizationMigrationCandidate, IMcpServerCustomizationMigrationFailure, IMcpServerCustomizationMigrationResult, isConfiguredLocationMigrationCandidate, isPromptFileMigrationCandidate, isUserDataMigrationCandidate, McpServerCustomizationMigration, McpServerCustomizationMigrationFailureReason, MigratableConfiguration } from '../../common/promptSyntax/service/customizationMigrationService.js';
+import { CustomizationMigration, CustomizationMigrationHintTarget, CustomizationMigrationType, FileCustomizationMigration, FileCustomizationMigrationType, getCustomizationMigrationEnablementSetting, getCustomizationMigrationTargetType, getMcpServerCustomizationMigrationCandidateKey, ICustomizationMigrationHint, ICustomizationMigrationService, IMcpServerCustomizationMigrationCandidate, IMcpServerCustomizationMigrationFailure, IMcpServerCustomizationMigrationResult, isConfiguredLocationMigrationCandidate, isPromptFileMigrationCandidate, isUserDataMigrationCandidate, McpServerCustomizationMigration, McpServerCustomizationMigrationFailureReason, MigratableConfiguration } from '../../common/promptSyntax/service/customizationMigrationService.js';
 import { IPromptsService, PromptsStorage } from '../../common/promptSyntax/service/promptsService.js';
 import { IAgentHostActiveClientService } from '../agentSessions/agentHost/agentHostActiveClientService.js';
 import { IAgentHostCustomizationService } from '../agentSessions/agentHost/agentHostCustomizationService.js';
@@ -37,6 +38,7 @@ export class CustomizationMigrationService extends Disposable implements ICustom
 		@IAgentHostCustomizationService private readonly agentHostCustomizationService: IAgentHostCustomizationService,
 		@IFileService fileService: IFileService,
 		@ILogService private readonly logService: ILogService,
+		@IConfigurationService private readonly configurationService: IConfigurationService,
 	) {
 		super();
 		this.mcpServerMigration = new McpServerCustomizationMigrator(fileService, logService);
@@ -56,6 +58,9 @@ export class CustomizationMigrationService extends Disposable implements ICustom
 			return type === CustomizationMigrationType.McpServers
 				? this.emptyMcpServerMigration()
 				: { type, files: [], candidates: [] };
+		}
+		if (type !== CustomizationMigrationType.McpServers && !this.isMigrationEnabled(type)) {
+			return { type, files: [], candidates: [] };
 		}
 
 		switch (type) {
@@ -139,6 +144,7 @@ export class CustomizationMigrationService extends Disposable implements ICustom
 			this.logService.info(`[MCP Customization Migration] Starting: selected=${requestedCandidates.length}, eligible=${eligibleCandidates.length}, stale=${failures.length}`);
 			const result = await this.mcpServerMigration.migrate(eligibleCandidates, {
 				isContextCurrent: isExecutionCurrent,
+				roots,
 			});
 			const combined = { migratedCount: result.migratedCount, failures: [...failures, ...result.failures] };
 			for (const failure of combined.failures) {
@@ -167,10 +173,12 @@ export class CustomizationMigrationService extends Disposable implements ICustom
 			this.computeMigration(sessionResource, CustomizationMigrationType.ConfiguredLocations, token),
 			this.computeMigration(sessionResource, CustomizationMigrationType.McpServers, token),
 		]);
-		const fileCandidates = [...userDataMigration.candidates, ...promptFilesMigration.candidates, ...configuredLocationsMigration.candidates];
+		const fileCandidates = [userDataMigration, promptFilesMigration, configuredLocationsMigration]
+			.filter(migration => this.isMigrationEnabled(migration.type))
+			.flatMap(migration => migration.candidates);
 		const workspaceFileCount = fileCandidates.filter(candidate => candidate.storage === PromptsStorage.local).length;
 		const userFileCount = fileCandidates.filter(candidate => candidate.storage === PromptsStorage.user).length;
-		const migratableMcpServerCount = mcpServerMigration.candidates.length;
+		const migratableMcpServerCount = this.isMigrationEnabled(CustomizationMigrationType.McpServers) ? mcpServerMigration.candidates.length : 0;
 		const unsupportedMcpServerCount = mcpServerMigration.servers.filter(server => !server.supported).length;
 		const fileHint = this.formatFileMigrationHint(workspaceFileCount, userFileCount, harness.label);
 		const migratableMcpHint = migratableMcpServerCount === 0
@@ -249,7 +257,9 @@ export class CustomizationMigrationService extends Disposable implements ICustom
 				return this.emptyMcpServerMigration();
 			}
 			const snapshot = scope.support.get();
-			const plan = await this.mcpServerMigration.createPlan(snapshot, roots);
+			const candidates = this.isMigrationEnabled(CustomizationMigrationType.McpServers)
+				? (await this.mcpServerMigration.createPlan(snapshot, roots)).candidates
+				: [];
 			if (token.isCancellationRequested || !this.areRootsEqual(roots, this.agentHostCustomizationService.getWorkingDirectoryUris(sessionResource))) {
 				return this.emptyMcpServerMigration();
 			}
@@ -262,7 +272,7 @@ export class CustomizationMigrationService extends Disposable implements ICustom
 						name: server.name,
 						supported: server.compatibility.kind === 'supported',
 					})),
-				candidates: plan.candidates,
+				candidates: this.isMigrationEnabled(CustomizationMigrationType.McpServers) ? candidates : [],
 				discoveryComplete: snapshot.discoveryComplete,
 				coverage: snapshot.coverage,
 			};
@@ -285,9 +295,14 @@ export class CustomizationMigrationService extends Disposable implements ICustom
 	}
 
 	private isExecutionContextCurrent(sessionResource: URI, roots: readonly URI[], generation: number): boolean {
-		return isEqual(sessionResource, this.customizationHarnessService.activeSessionResource.get())
+		return this.isMigrationEnabled(CustomizationMigrationType.McpServers)
+			&& isEqual(sessionResource, this.customizationHarnessService.activeSessionResource.get())
 			&& generation === this.activeContextGeneration
 			&& this.areRootsEqual(roots, this.agentHostCustomizationService.getWorkingDirectoryUris(sessionResource));
+	}
+
+	private isMigrationEnabled(type: CustomizationMigrationType): boolean {
+		return this.configurationService.getValue<boolean>(getCustomizationMigrationEnablementSetting(type)) === true;
 	}
 
 	/**
