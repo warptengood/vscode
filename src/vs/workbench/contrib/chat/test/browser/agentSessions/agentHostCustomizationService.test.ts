@@ -124,7 +124,7 @@ suite('AbstractAgentHostCustomizationService', () => {
 			const target = new FakeTarget([mcpServer('server-1', 'Server One')], hostRoots[0], undefined, resourceUris, hostRoots);
 			sut.setTarget(session, target);
 
-			const clientRoots = sut.getWorkingDirectoryUris(session);
+			const clientRoots = sut.getClientWorkingDirectoryUris(session);
 			sut.setCustomizationEnablement(session, 'server-1', undefined, CustomizationEnablementKind.Workspace, false);
 
 			assert.deepStrictEqual({
@@ -146,10 +146,10 @@ suite('AbstractAgentHostCustomizationService', () => {
 	test('returns no client roots when the session or working directories are missing', () => {
 		const sut = createSut();
 		const session = URI.parse('vscode-agent-session:///session-1');
-		const missingSessionRoots = sut.getWorkingDirectoryUris(session);
+		const missingSessionRoots = sut.getClientWorkingDirectoryUris(session);
 		sut.setTarget(session, new FakeTarget([]));
 
-		assert.deepStrictEqual({ missingSessionRoots, emptyRoots: sut.getWorkingDirectoryUris(session) }, { missingSessionRoots: [], emptyRoots: [] });
+		assert.deepStrictEqual({ missingSessionRoots, emptyRoots: sut.getClientWorkingDirectoryUris(session) }, { missingSessionRoots: [], emptyRoots: [] });
 	});
 
 	test('dispatches complete enablement decisions', () => {

@@ -251,7 +251,7 @@ suite('CustomizationMigrationService', () => {
 		} as Partial<IAgentHostActiveClientService> as IAgentHostActiveClientService;
 		const agentHostCustomizationService = {
 			onDidChangeCustomizations: Event.None,
-			getWorkingDirectoryUris: () => [root],
+			getClientWorkingDirectoryUris: () => [root],
 		} as Partial<IAgentHostCustomizationService> as IAgentHostCustomizationService;
 		const service = store.add(new CustomizationMigrationService(promptsService, harnessService, activeClientService, agentHostCustomizationService, {} as IFileService, new NullLogService(), store.add(createMigrationConfiguration())));
 		const agentHostSessionResource = URI.from({ scheme: SessionType.AgentHostCopilot, path: '/session' });
@@ -373,7 +373,7 @@ suite('CustomizationMigrationService', () => {
 		}();
 		const agentHostCustomizationService = new class extends mock<IAgentHostCustomizationService>() {
 			override readonly onDidChangeCustomizations = Event.None;
-			override getWorkingDirectoryUris() { return []; }
+			override getClientWorkingDirectoryUris() { return []; }
 		}();
 		const service = store.add(new CustomizationMigrationService(promptsService, harnessService, activeClientService, agentHostCustomizationService, {} as IFileService, new NullLogService(), store.add(createMigrationConfiguration())));
 
@@ -398,7 +398,7 @@ suite('CustomizationMigrationService', () => {
 		}();
 		const agentHostCustomizationService = new class extends mock<IAgentHostCustomizationService>() {
 			override readonly onDidChangeCustomizations = Event.None;
-			override getWorkingDirectoryUris() { return []; }
+			override getClientWorkingDirectoryUris() { return []; }
 		}();
 		const service = store.add(new CustomizationMigrationService(promptsService, harnessService, activeClientService, agentHostCustomizationService, {} as IFileService, new NullLogService(), store.add(createMigrationConfiguration())));
 
@@ -449,7 +449,7 @@ suite('CustomizationMigrationService', () => {
 		} as Partial<IAgentHostActiveClientService> as IAgentHostActiveClientService;
 		const agentHostCustomizationService = new class extends mock<IAgentHostCustomizationService>() {
 			override readonly onDidChangeCustomizations = Event.None;
-			override getWorkingDirectoryUris() { return []; }
+			override getClientWorkingDirectoryUris() { return []; }
 		}();
 		const service = store.add(new CustomizationMigrationService(promptsService, harnessService, activeClientService, agentHostCustomizationService, {} as IFileService, new NullLogService(), store.add(createMigrationConfiguration())));
 
@@ -512,7 +512,7 @@ suite('CustomizationMigrationService', () => {
 		} as Partial<IAgentHostActiveClientService> as IAgentHostActiveClientService;
 		const agentHostCustomizationService = {
 			onDidChangeCustomizations: Event.None,
-			getWorkingDirectoryUris: () => [root],
+			getClientWorkingDirectoryUris: () => [root],
 		} as Partial<IAgentHostCustomizationService> as IAgentHostCustomizationService;
 		const configurationService = store.add(createMigrationConfiguration({ [CustomizationMigrationType.McpServers]: false }));
 		const service = store.add(new CustomizationMigrationService(store.add(new TestPromptsService([])), harnessService, activeClientService, agentHostCustomizationService, fileService, new NullLogService(), configurationService));
@@ -646,7 +646,7 @@ suite('CustomizationMigrationService', () => {
 		} as Partial<IAgentHostActiveClientService> as IAgentHostActiveClientService;
 		const agentHostCustomizationService = {
 			onDidChangeCustomizations: Event.None,
-			getWorkingDirectoryUris: () => [root],
+			getClientWorkingDirectoryUris: () => [root],
 		} as Partial<IAgentHostCustomizationService> as IAgentHostCustomizationService;
 		const service = store.add(new CustomizationMigrationService(store.add(new TestPromptsService([])), harnessService, activeClientService, agentHostCustomizationService, fileService, new NullLogService(), store.add(createMigrationConfiguration({ [CustomizationMigrationType.McpServers]: false }))));
 
@@ -689,7 +689,7 @@ suite('CustomizationMigrationService', () => {
 		}();
 		const agentHostCustomizationService = new class extends mock<IAgentHostCustomizationService>() {
 			override readonly onDidChangeCustomizations = Event.None;
-			override getWorkingDirectoryUris() { return []; }
+			override getClientWorkingDirectoryUris() { return []; }
 		}();
 		const configurationService = store.add(createMigrationConfiguration({
 			[CustomizationMigrationType.UserData]: false,
@@ -792,7 +792,7 @@ suite('CustomizationMigrationService', () => {
 		} as Partial<IAgentHostActiveClientService> as IAgentHostActiveClientService;
 		const agentHostCustomizationService = {
 			onDidChangeCustomizations: Event.None,
-			getWorkingDirectoryUris: () => [root],
+			getClientWorkingDirectoryUris: () => [root],
 		} as Partial<IAgentHostCustomizationService> as IAgentHostCustomizationService;
 		const service = store.add(new CustomizationMigrationService(store.add(new TestPromptsService([])), harnessService, activeClientService, agentHostCustomizationService, fileService, new NullLogService(), store.add(createMigrationConfiguration())));
 		const migration = await service.computeMigration(activeSessionResource.get(), CustomizationMigrationType.McpServers);
@@ -877,7 +877,7 @@ suite('CustomizationMigrationService', () => {
 		let roots = [root];
 		const agentHostCustomizationService = {
 			onDidChangeCustomizations: Event.None,
-			getWorkingDirectoryUris: () => roots,
+			getClientWorkingDirectoryUris: () => roots,
 		} as Partial<IAgentHostCustomizationService> as IAgentHostCustomizationService;
 		const service = store.add(new CustomizationMigrationService(store.add(new TestPromptsService([])), harnessService, activeClientService, agentHostCustomizationService, {} as IFileService, new NullLogService(), store.add(createMigrationConfiguration())));
 		const requested = [{
@@ -955,7 +955,7 @@ suite('CustomizationMigrationService', () => {
 		} as Partial<IAgentHostActiveClientService> as IAgentHostActiveClientService;
 		const agentHostCustomizationService = {
 			onDidChangeCustomizations: Event.None,
-			getWorkingDirectoryUris: () => [root],
+			getClientWorkingDirectoryUris: () => [root],
 		} as Partial<IAgentHostCustomizationService> as IAgentHostCustomizationService;
 		const service = store.add(new CustomizationMigrationService(store.add(new TestPromptsService([])), harnessService, activeClientService, agentHostCustomizationService, fileService, new NullLogService(), store.add(createMigrationConfiguration())));
 
@@ -1003,7 +1003,7 @@ suite('CustomizationMigrationService', () => {
 		} as Partial<IAgentHostActiveClientService> as IAgentHostActiveClientService;
 		const agentHostCustomizationService = {
 			onDidChangeCustomizations: Event.None,
-			getWorkingDirectoryUris: () => [root],
+			getClientWorkingDirectoryUris: () => [root],
 		} as Partial<IAgentHostCustomizationService> as IAgentHostCustomizationService;
 		const service = store.add(new CustomizationMigrationService(store.add(new TestPromptsService([])), harnessService, activeClientService, agentHostCustomizationService, {} as IFileService, new NullLogService(), store.add(createMigrationConfiguration())));
 		const tokenSource = store.add(new CancellationTokenSource());
@@ -1090,7 +1090,7 @@ suite('CustomizationMigrationService', () => {
 			const agentHostCustomizationService = new class extends mock<IAgentHostCustomizationService>() {
 				override readonly onDidChangeCustomizations = Event.None;
 				override getWorkingDirectories() { return [hostRoot.toString()]; }
-				override getWorkingDirectoryUris() { return [remoteRoot]; }
+				override getClientWorkingDirectoryUris() { return [remoteRoot]; }
 			}();
 			const harnessService = new TestCustomizationHarnessService();
 			const service = store.add(new CustomizationMigrationService(store.add(new TestPromptsService([])), harnessService, activeClientService, agentHostCustomizationService, fileService, new NullLogService(), store.add(createMigrationConfiguration())));

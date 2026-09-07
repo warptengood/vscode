@@ -82,7 +82,7 @@ suite('WorkbenchAgentHostCustomizationService', () => {
 
 		const readRoots = () => ({
 			host: service.getWorkingDirectories(session),
-			client: service.getWorkingDirectoryUris(session).map(uri => ({ scheme: uri.scheme, authority: uri.authority, path: uri.path })),
+			client: service.getClientWorkingDirectoryUris(session).map(uri => ({ scheme: uri.scheme, authority: uri.authority, path: uri.path })),
 		});
 		const provisional = readRoots();
 		subscription.verifiedValue = {

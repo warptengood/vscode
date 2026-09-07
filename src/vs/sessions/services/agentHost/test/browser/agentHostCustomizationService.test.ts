@@ -157,9 +157,9 @@ suite('AgentHostCustomizationService', () => {
 			assert.deepStrictEqual({
 				primaryRoot: service.getWorkingDirectory(sessionResource),
 				hostRoots: service.getWorkingDirectories(sessionResource),
-				clientRoots: service.getWorkingDirectoryUris(sessionResource).map(root => root.toString()),
+				clientRoots: service.getClientWorkingDirectoryUris(sessionResource).map(root => root.toString()),
 				mcpSource: service.getMcpServers(sessionResource)[0].sourceUri?.toString(),
-				missingSessionRoots: service.getWorkingDirectoryUris(URI.parse('agent-host-copilot:///missing')),
+				missingSessionRoots: service.getClientWorkingDirectoryUris(URI.parse('agent-host-copilot:///missing')),
 				feedbackChannelReads,
 			}, {
 				primaryRoot: roots[0].toString(),

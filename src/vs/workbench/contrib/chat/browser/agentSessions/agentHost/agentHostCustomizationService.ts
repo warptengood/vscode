@@ -53,11 +53,11 @@ export interface IAgentHostCustomizationService {
 	/** The primary working-directory URI string in the agent host's URI space. */
 	getWorkingDirectory(sessionResource: URI): string | undefined;
 
-	/** The ordered host-side working-directory URI strings (primary first), or empty when none are known. */
+	/** The ordered roots in the Agent Host's URI space, for protocol values and host-side comparisons. */
 	getWorkingDirectories(sessionResource: URI): readonly string[];
 
-	/** The ordered working-directory roots as client-resolvable URIs for filesystem access. */
-	getWorkingDirectoryUris(sessionResource: URI): readonly URI[];
+	/** The ordered roots in the client's URI space for filesystem access. */
+	getClientWorkingDirectoryUris(sessionResource: URI): readonly URI[];
 
 	/**
 	 * Returns the MCP servers exposed by an agent-host session. Each entry
@@ -117,7 +117,7 @@ export class NullAgentHostCustomizationService implements IAgentHostCustomizatio
 	getWorkingDirectories(_sessionResource: URI): readonly string[] {
 		return [];
 	}
-	getWorkingDirectoryUris(_sessionResource: URI): readonly URI[] {
+	getClientWorkingDirectoryUris(_sessionResource: URI): readonly URI[] {
 		return [];
 	}
 	getMcpServers(_sessionResource: URI): readonly IAgentHostMcpServer[] {
@@ -201,7 +201,7 @@ export abstract class AbstractAgentHostCustomizationService extends Disposable i
 		return this._resolveTarget(sessionResource)?.workingDirectories ?? [];
 	}
 
-	getWorkingDirectoryUris(sessionResource: URI): readonly URI[] {
+	getClientWorkingDirectoryUris(sessionResource: URI): readonly URI[] {
 		const target = this._resolveTarget(sessionResource);
 		if (!target) {
 			return [];
