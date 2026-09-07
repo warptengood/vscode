@@ -711,12 +711,12 @@ function canonicalizeSourceConfiguration(rawConfiguration: unknown): Record<stri
 		return undefined;
 	}
 	if (configuration.type === McpServerType.LOCAL) {
-		if ((rawConfiguration['args'] !== undefined && (!Array.isArray(rawConfiguration['args']) || rawConfiguration['args'].some(value => typeof value !== 'string')))
-			|| (rawConfiguration['env'] !== undefined && (!isJsonObject(rawConfiguration['env']) || Object.values(rawConfiguration['env']).some(value => typeof value !== 'string' && typeof value !== 'number' && value !== null)))) {
+		if ((rawConfiguration.args !== undefined && (!Array.isArray(rawConfiguration.args) || rawConfiguration.args.some(value => typeof value !== 'string')))
+			|| (rawConfiguration.env !== undefined && (!isJsonObject(rawConfiguration.env) || Object.values(rawConfiguration.env).some(value => typeof value !== 'string' && typeof value !== 'number' && value !== null)))) {
 			return undefined;
 		}
-	} else if (rawConfiguration['headers'] !== undefined
-		&& (!isJsonObject(rawConfiguration['headers']) || Object.values(rawConfiguration['headers']).some(value => typeof value !== 'string'))) {
+	} else if (rawConfiguration.headers !== undefined
+		&& (!isJsonObject(rawConfiguration.headers) || Object.values(rawConfiguration.headers).some(value => typeof value !== 'string'))) {
 		return undefined;
 	}
 	return canonicalizeConfiguration(configuration);
