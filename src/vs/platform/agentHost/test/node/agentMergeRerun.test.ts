@@ -28,6 +28,7 @@ import { ActionType } from '../../common/state/protocol/common/actions.js';
 import { buildDefaultChatUri, MessageKind, SessionStatus, withSessionGitHubState, withSessionGitState } from '../../common/state/sessionState.js';
 import { AgentConfigurationService } from '../../node/agentConfigurationService.js';
 import { AgentHostGitHubEndpointService } from '../../node/agentHostGitHubEndpointService.js';
+import type { IAgentHostProviderService } from '../../node/agentHostProviderService.js';
 import { AgentHostStateManager } from '../../node/agentHostStateManager.js';
 import { AgentMergeController } from '../../node/agentMergeController.js';
 import { AgentMergeTools } from '../../node/agentMergeTools.js';
@@ -434,7 +435,6 @@ class RerunTestHarness extends Disposable {
 					duration: 0,
 				}),
 				postNotice: () => { },
-				getAutonomousSessionConfig: () => ({}),
 			},
 			this.stateManager,
 			this.configurationService,
@@ -446,6 +446,9 @@ class RerunTestHarness extends Disposable {
 			new class extends mock<IAgentHostGitService>() { }(),
 			gitHubService,
 			this._register(new AgentHostGitHubEndpointService(this.configurationService, this.logService)),
+			new class extends mock<IAgentHostProviderService>() {
+				override getProviderForSession(): undefined { return undefined; }
+			}(),
 			this.logService,
 		));
 		this.tools = new AgentMergeTools(() => this.controller.isEnabled(), session => this.controller.getTurnContext(session), gitHubService, this.logService);
