@@ -9,7 +9,7 @@ import { VSBuffer } from '../../../../../../base/common/buffer.js';
 import { CancellationTokenSource } from '../../../../../../base/common/cancellation.js';
 import { Codicon } from '../../../../../../base/common/codicons.js';
 import { Event } from '../../../../../../base/common/event.js';
-import { constObservable, observableValue } from '../../../../../../base/common/observable.js';
+import { constObservable, ISettableObservable, observableValue } from '../../../../../../base/common/observable.js';
 import { Schemas } from '../../../../../../base/common/network.js';
 import { isEqual } from '../../../../../../base/common/resources.js';
 import { URI } from '../../../../../../base/common/uri.js';
@@ -80,6 +80,40 @@ class TrackingFileSystemProvider extends SupportChangingFileSystemProvider {
 	}
 }
 
+class MutableMcpServerSupportScope {
+	readonly support: ISettableObservable<IAgentHostMcpServerSupportSnapshot>;
+	readonly isResolved = observableValue('supportResolved', true);
+	private latestResolution = new DeferredPromise<void>();
+
+	constructor(snapshot: IAgentHostMcpServerSupportSnapshot) {
+		this.support = observableValue<IAgentHostMcpServerSupportSnapshot>('support', snapshot);
+		this.latestResolution.complete();
+	}
+
+	queue(): void {
+		const previousResolution = this.latestResolution;
+		this.latestResolution = new DeferredPromise<void>();
+		this.isResolved.set(false, undefined);
+		if (!previousResolution.isSettled) {
+			previousResolution.complete();
+		}
+	}
+
+	settle(snapshot: IAgentHostMcpServerSupportSnapshot): void {
+		this.support.set(snapshot, undefined);
+		this.isResolved.set(true, undefined);
+		if (!this.latestResolution.isSettled) {
+			this.latestResolution.complete();
+		}
+	}
+
+	whenResolved(): Promise<void> {
+		return this.latestResolution.p;
+	}
+
+	dispose(): void { }
+}
+
 class TestCustomizationHarnessService extends mock<ICustomizationHarnessService>() {
 	readonly requestedSourceFolderTypes: PromptsType[] = [];
 	override readonly activeSessionResource;
@@ -147,6 +181,38 @@ function createMigrationConfiguration(overrides: Partial<Record<CustomizationMig
 
 function setMigrationEnabled(configurationService: TestConfigurationService, type: CustomizationMigrationType, enabled: boolean): Promise<void> {
 	return configurationService.setUserConfiguration(getCustomizationMigrationEnablementSetting(type), enabled);
+}
+
+function createWorkspaceMcpSupportSnapshot(root: URI, options: {
+	readonly enablement?: { readonly enabled: boolean; readonly state: AgentHostMcpServerEnablementState };
+	readonly compatibility?: IAgentHostMcpServerSupportSnapshot['servers'][number]['compatibility'];
+	readonly command?: string;
+} = {}): IAgentHostMcpServerSupportSnapshot {
+	const sourceUri = URI.joinPath(root, '.vscode', 'mcp.json');
+	return {
+		servers: [{
+			id: 'mcp.config.ws0.server',
+			name: 'server',
+			collectionId: 'mcp.config.ws0',
+			source: {
+				group: undefined,
+				kind: AgentHostMcpServerSourceKind.VscodeWorkspaceFolder,
+				label: 'Workspace',
+				collectionUri: sourceUri,
+				definitionLocation: undefined,
+				remoteAuthority: null,
+				extensionId: undefined,
+				pluginUri: undefined,
+			},
+			enablement: options.enablement ?? { enabled: true, state: AgentHostMcpServerEnablementState.EnabledWorkspace },
+			applicability: AgentHostMcpServerApplicability.Applicable,
+			delivery: AgentHostMcpServerDelivery.ClientForwarded,
+			compatibility: options.compatibility ?? { kind: 'supported' },
+			projectedConfiguration: { type: McpServerType.LOCAL, command: options.command ?? 'node' },
+		}],
+		discoveryComplete: true,
+		coverage: { restrictedByMcpAccess: false, restrictedByCustomizationPolicy: false },
+	};
 }
 
 suite('CustomizationMigrationService', () => {
@@ -581,6 +647,70 @@ suite('CustomizationMigrationService', () => {
 		});
 	});
 
+	test('waits for queued MCP support before planning migration execution', async () => {
+		const root = URI.file('/queued-before-plan');
+		const sourceUri = URI.joinPath(root, '.vscode', 'mcp.json');
+		const targetUri = URI.joinPath(root, '.mcp.json');
+		const fileService = store.add(new FileService(new NullLogService()));
+		const fileProvider = store.add(new TrackingFileSystemProvider());
+		store.add(fileService.registerProvider(Schemas.file, fileProvider));
+		await fileService.writeFile(sourceUri, VSBuffer.fromString('{"servers":{"server":{"command":"node"}}}'));
+		await fileService.writeFile(targetUri, VSBuffer.fromString('{"mcpServers":{}}'));
+		fileProvider.resetRequests();
+
+		const activeSessionResource = observableValue('activeSessionResource', URI.from({ scheme: SessionType.AgentHostCopilot, path: '/session' }));
+		const activeHarness = observableValue('activeHarness', SessionType.AgentHostCopilot);
+		const harnessService = new class extends TestCustomizationHarnessService {
+			override readonly activeSessionResource = activeSessionResource;
+			override readonly activeHarness = activeHarness;
+		}();
+		const supportScope = new MutableMcpServerSupportScope(createWorkspaceMcpSupportSnapshot(root));
+		supportScope.queue();
+		const activeClientService = {
+			acquireMcpServerSupportScope: () => supportScope,
+		} as Partial<IAgentHostActiveClientService> as IAgentHostActiveClientService;
+		const agentHostCustomizationService = {
+			onDidChangeCustomizations: Event.None,
+			getClientWorkingDirectoryUris: () => [root],
+		} as Partial<IAgentHostCustomizationService> as IAgentHostCustomizationService;
+		const service = store.add(new CustomizationMigrationService(store.add(new TestPromptsService([])), harnessService, activeClientService, agentHostCustomizationService, fileService, new NullLogService(), store.add(createMigrationConfiguration())));
+		const requested = [{
+			type: CustomizationMigrationType.McpServers,
+			id: 'mcp.config.ws0.server',
+			name: 'server',
+			sourceUri,
+			targetUri,
+			projectedConfiguration: { type: McpServerType.LOCAL, command: 'node' },
+		}] as const;
+
+		const migration = service.migrateMcpServers(activeSessionResource.get(), requested);
+		await Promise.resolve();
+		const readsBeforeSupportSettled = fileProvider.readRequests.map(resource => resource.path);
+		supportScope.settle(createWorkspaceMcpSupportSnapshot(root, {
+			enablement: { enabled: false, state: AgentHostMcpServerEnablementState.DisabledWorkspace },
+		}));
+		const result = await migration;
+
+		assert.deepStrictEqual({
+			readsBeforeSupportSettled,
+			result: {
+				migratedCount: result.migratedCount,
+				failures: result.failures.map(failure => failure.reason),
+			},
+			reads: fileProvider.readRequests.map(resource => resource.path),
+			writes: fileProvider.writeRequests.map(resource => resource.path),
+			source: JSON.parse((await fileService.readFile(sourceUri)).value.toString()),
+			target: JSON.parse((await fileService.readFile(targetUri)).value.toString()),
+		}, {
+			readsBeforeSupportSettled: [],
+			result: { migratedCount: 0, failures: ['noLongerEligible'] },
+			reads: [],
+			writes: [],
+			source: { servers: { server: { command: 'node' } } },
+			target: { mcpServers: {} },
+		});
+	});
+
 	test('keeps MCP support diagnostics when MCP migration is disabled', async () => {
 		const root = URI.file('/workspace');
 		const sourceUri = URI.joinPath(root, '.vscode', 'mcp.json');
@@ -756,39 +886,16 @@ suite('CustomizationMigrationService', () => {
 			override readonly activeSessionResource = activeSessionResource;
 			override readonly activeHarness = activeHarness;
 		}();
-		let snapshot: IAgentHostMcpServerSupportSnapshot = {
-			servers: [{
-				id: 'mcp.config.ws0.server',
-				name: 'server',
-				collectionId: 'mcp.config.ws0',
-				source: {
-					group: undefined,
-					kind: AgentHostMcpServerSourceKind.VscodeWorkspaceFolder,
-					label: 'Workspace',
-					collectionUri: sourceUri,
-					definitionLocation: undefined,
-					remoteAuthority: null,
-					extensionId: undefined,
-					pluginUri: undefined,
-				},
-				enablement: { enabled: true, state: AgentHostMcpServerEnablementState.EnabledWorkspace },
-				applicability: AgentHostMcpServerApplicability.Applicable,
-				delivery: AgentHostMcpServerDelivery.ClientForwarded,
-				compatibility: { kind: 'supported' },
-				projectedConfiguration: { type: McpServerType.LOCAL, command: 'node' },
-			}],
-			discoveryComplete: true,
-			coverage: { restrictedByMcpAccess: false, restrictedByCustomizationPolicy: false },
-		};
-		const supportedSnapshot = snapshot;
-		const snapshotObservable = observableValue('snapshot', snapshot);
+		const supportedSnapshot = createWorkspaceMcpSupportSnapshot(root);
+		const unsupportedSnapshot = createWorkspaceMcpSupportSnapshot(root, {
+			compatibility: { kind: 'unsupported', reasons: [AgentHostMcpSupportReason.LaunchNotRepresentable] },
+		});
+		const disabledSnapshot = createWorkspaceMcpSupportSnapshot(root, {
+			enablement: { enabled: false, state: AgentHostMcpServerEnablementState.DisabledWorkspace },
+		});
+		const supportScope = new MutableMcpServerSupportScope(supportedSnapshot);
 		const activeClientService = {
-			acquireMcpServerSupportScope: () => ({
-				support: snapshotObservable,
-				isResolved: constObservable(true),
-				whenResolved: () => Promise.resolve(),
-				dispose: () => { },
-			}),
+			acquireMcpServerSupportScope: () => supportScope,
 		} as Partial<IAgentHostActiveClientService> as IAgentHostActiveClientService;
 		const agentHostCustomizationService = {
 			onDidChangeCustomizations: Event.None,
@@ -797,25 +904,19 @@ suite('CustomizationMigrationService', () => {
 		const service = store.add(new CustomizationMigrationService(store.add(new TestPromptsService([])), harnessService, activeClientService, agentHostCustomizationService, fileService, new NullLogService(), store.add(createMigrationConfiguration())));
 		const migration = await service.computeMigration(activeSessionResource.get(), CustomizationMigrationType.McpServers);
 		const hint = await service.computeMigrationHint(activeSessionResource.get());
-		snapshot = {
-			...snapshot,
-			servers: snapshot.servers.map(server => ({ ...server, compatibility: { kind: 'unsupported', reasons: [AgentHostMcpSupportReason.LaunchNotRepresentable] } })),
-		};
-		snapshotObservable.set(snapshot, undefined);
+		supportScope.settle(unsupportedSnapshot);
 		const result = await service.migrateMcpServers(activeSessionResource.get(), migration.candidates);
-		snapshot = supportedSnapshot;
-		snapshotObservable.set(snapshot, undefined);
+		supportScope.settle(supportedSnapshot);
+		const targetWriteRefreshQueued = new DeferredPromise<void>();
 		fileProvider.afterTargetWrite = () => {
-			snapshot = {
-				...supportedSnapshot,
-				servers: supportedSnapshot.servers.map(server => ({
-					...server,
-					enablement: { enabled: false, state: AgentHostMcpServerEnablementState.DisabledWorkspace },
-				})),
-			};
-			snapshotObservable.set(snapshot, undefined);
+			supportScope.queue();
+			targetWriteRefreshQueued.complete();
 		};
-		const changedDuringWriteResult = await service.migrateMcpServers(activeSessionResource.get(), migration.candidates);
+		const changedDuringWrite = service.migrateMcpServers(activeSessionResource.get(), migration.candidates);
+		await targetWriteRefreshQueued.p;
+		const sourceBeforeSupportSettled = (await fileService.readFile(sourceUri)).value.toString();
+		supportScope.settle(disabledSnapshot);
+		const changedDuringWriteResult = await changedDuringWrite;
 
 		assert.deepStrictEqual({
 			candidates: migration.candidates.map(candidate => ({
@@ -832,6 +933,7 @@ suite('CustomizationMigrationService', () => {
 				migratedCount: changedDuringWriteResult.migratedCount,
 				failures: changedDuringWriteResult.failures.map(failure => failure.reason),
 			},
+			sourceBeforeSupportSettled,
 			source: (await fileService.readFile(sourceUri)).value.toString(),
 			target: (await fileService.readFile(targetUri)).value.toString(),
 		}, {
@@ -842,6 +944,7 @@ suite('CustomizationMigrationService', () => {
 			},
 			result: { migratedCount: 0, failures: ['noLongerEligible'] },
 			changedDuringWriteResult: { migratedCount: 0, failures: ['noLongerEligible'] },
+			sourceBeforeSupportSettled: '{"servers":{"server":{"command":"node"}}}',
 			source: '{"servers":{"server":{"command":"node"}}}',
 			target: '{"mcpServers":{}}',
 		});
@@ -914,44 +1017,15 @@ suite('CustomizationMigrationService', () => {
 			override readonly activeSessionResource = activeSessionResource;
 			override readonly activeHarness = activeHarness;
 		}();
-		const snapshot: IAgentHostMcpServerSupportSnapshot = {
-			servers: [{
-				id: 'mcp.config.ws0.server',
-				name: 'server',
-				collectionId: 'mcp.config.ws0',
-				source: {
-					group: undefined,
-					kind: AgentHostMcpServerSourceKind.VscodeWorkspaceFolder,
-					label: 'Workspace',
-					collectionUri: sourceUri,
-					definitionLocation: undefined,
-					remoteAuthority: null,
-					extensionId: undefined,
-					pluginUri: undefined,
-				},
-				enablement: { enabled: true, state: AgentHostMcpServerEnablementState.EnabledWorkspace },
-				applicability: AgentHostMcpServerApplicability.Applicable,
-				delivery: AgentHostMcpServerDelivery.ClientForwarded,
-				compatibility: { kind: 'supported' },
-				projectedConfiguration: { type: McpServerType.LOCAL, command: 'node' },
-			}],
-			discoveryComplete: true,
-			coverage: { restrictedByMcpAccess: false, restrictedByCustomizationPolicy: false },
+		const snapshot = createWorkspaceMcpSupportSnapshot(root);
+		const supportScope = new MutableMcpServerSupportScope(snapshot);
+		const targetWriteRefreshQueued = new DeferredPromise<void>();
+		fileProvider.afterTargetWrite = () => {
+			supportScope.queue();
+			targetWriteRefreshQueued.complete();
 		};
-		const snapshotObservable = observableValue('snapshot', snapshot);
-		// The support scope watches MCP definitions, so migrating republishes an equal-but-new snapshot.
-		fileProvider.afterTargetWrite = () => snapshotObservable.set({
-			...snapshot,
-			servers: snapshot.servers.map(server => ({ ...server })),
-			coverage: { ...snapshot.coverage },
-		}, undefined);
 		const activeClientService = {
-			acquireMcpServerSupportScope: () => ({
-				support: snapshotObservable,
-				isResolved: constObservable(true),
-				whenResolved: () => Promise.resolve(),
-				dispose: () => { },
-			}),
+			acquireMcpServerSupportScope: () => supportScope,
 		} as Partial<IAgentHostActiveClientService> as IAgentHostActiveClientService;
 		const agentHostCustomizationService = {
 			onDidChangeCustomizations: Event.None,
@@ -960,18 +1034,90 @@ suite('CustomizationMigrationService', () => {
 		const service = store.add(new CustomizationMigrationService(store.add(new TestPromptsService([])), harnessService, activeClientService, agentHostCustomizationService, fileService, new NullLogService(), store.add(createMigrationConfiguration())));
 
 		const migration = await service.computeMigration(activeSessionResource.get(), CustomizationMigrationType.McpServers);
-		const result = await service.migrateMcpServers(activeSessionResource.get(), migration.candidates);
+		const resultPromise = service.migrateMcpServers(activeSessionResource.get(), migration.candidates);
+		await targetWriteRefreshQueued.p;
+		const sourceBeforeSupportSettled = JSON.parse((await fileService.readFile(sourceUri)).value.toString());
+		supportScope.settle({
+			...snapshot,
+			servers: snapshot.servers.map(server => ({ ...server })),
+			coverage: { ...snapshot.coverage },
+		});
+		const result = await resultPromise;
 
 		assert.deepStrictEqual({
 			migratedCount: result.migratedCount,
 			failures: result.failures.map(failure => failure.reason),
+			sourceBeforeSupportSettled,
 			source: JSON.parse((await fileService.readFile(sourceUri)).value.toString()),
 			target: JSON.parse((await fileService.readFile(targetUri)).value.toString()),
 		}, {
 			migratedCount: 1,
 			failures: [],
+			sourceBeforeSupportSettled: { servers: { server: { command: 'node' } } },
 			source: { servers: {} },
 			target: { mcpServers: { server: { type: 'stdio', command: 'node' } } },
+		});
+	});
+
+	test('continues remaining groups after support drops an already migrated server', async () => {
+		const roots = [URI.file('/first'), URI.file('/second')];
+		const snapshot: IAgentHostMcpServerSupportSnapshot = {
+			...createWorkspaceMcpSupportSnapshot(roots[0]),
+			servers: roots.map((root, index) => ({
+				...createWorkspaceMcpSupportSnapshot(root).servers[0],
+				id: `mcp.config.ws${index}.server${index}`,
+				name: `server${index}`,
+			})),
+		};
+		const scope = new MutableMcpServerSupportScope(snapshot);
+		const firstCompleted = new DeferredPromise<void>();
+		const firstSource = URI.joinPath(roots[0], '.vscode', 'mcp.json');
+		const fileService = store.add(new FileService(new NullLogService()));
+		let executing = false;
+		const provider = store.add(new class extends InMemoryFileSystemProvider {
+			override async writeFile(resource: URI, content: Uint8Array, options: IFileWriteOptions): Promise<void> {
+				await super.writeFile(resource, content, options);
+				if (executing && isEqual(resource, firstSource)) {
+					scope.queue();
+					firstCompleted.complete();
+				}
+			}
+		}());
+		store.add(fileService.registerProvider(Schemas.file, provider));
+		for (const [index, root] of roots.entries()) {
+			await fileService.writeFile(URI.joinPath(root, '.vscode', 'mcp.json'), VSBuffer.fromString(JSON.stringify({ servers: { [`server${index}`]: { command: 'node' } } })));
+		}
+		const harness = new TestCustomizationHarnessService();
+		const service = store.add(new CustomizationMigrationService(
+			store.add(new TestPromptsService([])), harness,
+			new class extends mock<IAgentHostActiveClientService>() {
+				override acquireMcpServerSupportScope() { return scope; }
+			}(),
+			new class extends mock<IAgentHostCustomizationService>() {
+				override readonly onDidChangeCustomizations = Event.None;
+				override getClientWorkingDirectoryUris() { return roots; }
+			}(),
+			fileService, new NullLogService(), store.add(createMigrationConfiguration()),
+		));
+		const session = harness.activeSessionResource.get();
+		const plan = await service.computeMigration(session, CustomizationMigrationType.McpServers);
+		executing = true;
+		const pending = service.migrateMcpServers(session, plan.candidates);
+		await firstCompleted.p;
+		scope.settle({ ...snapshot, servers: snapshot.servers.slice(1) });
+		const result = await pending;
+
+		assert.deepStrictEqual({
+			result,
+			sources: await Promise.all(roots.map(async root => JSON.parse((await fileService.readFile(URI.joinPath(root, '.vscode', 'mcp.json'))).value.toString()))),
+			targets: await Promise.all(roots.map(async root => JSON.parse((await fileService.readFile(URI.joinPath(root, '.mcp.json'))).value.toString()))),
+		}, {
+			result: { migratedCount: 2, failures: [] },
+			sources: [{ servers: {} }, { servers: {} }],
+			targets: [
+				{ mcpServers: { server0: { type: 'stdio', command: 'node' } } },
+				{ mcpServers: { server1: { type: 'stdio', command: 'node' } } },
+			],
 		});
 	});
 

@@ -44,7 +44,7 @@ interface IMcpTargetDocument extends IJsonDocument {
 }
 
 interface IMcpServerCustomizationMigrationExecutionOptions {
-	readonly isContextCurrent?: (candidates: readonly IMcpServerCustomizationMigrationCandidate[]) => boolean;
+	readonly isContextCurrent?: (candidates: readonly IMcpServerCustomizationMigrationCandidate[]) => boolean | Promise<boolean>;
 	readonly roots?: readonly URI[];
 }
 
@@ -216,7 +216,7 @@ async function executeMigration(
 	const workingDirectories = [...roots.values()];
 	let migratedCount = 0;
 	for (const group of groups.values()) {
-		if (options.isContextCurrent?.(group.candidates) === false) {
+		if (await options.isContextCurrent?.(group.candidates) === false) {
 			logService.trace(`${LOG_PREFIX} Skipping ${group.sourceUri.toString()}: execution context changed before the group started.`);
 			failures.push(...group.candidates.map(candidate => createFailure(candidate, McpServerCustomizationMigrationFailureReason.NoLongerEligible)));
 			continue;
@@ -372,7 +372,7 @@ async function migrateGroup(
 		logService.trace(`${LOG_PREFIX} Nothing left to migrate from ${group.sourceUri.toString()}.`);
 		return { migratedCount: 0, failures };
 	}
-	if (options.isContextCurrent?.(candidatesToMigrate) === false) {
+	if (await options.isContextCurrent?.(candidatesToMigrate) === false) {
 		logService.trace(`${LOG_PREFIX} Aborting ${group.sourceUri.toString()} before any write: execution context changed.`);
 		return {
 			migratedCount: 0,
@@ -398,11 +398,20 @@ async function migrateGroup(
 	}
 
 	let writtenTarget: IFileStatWithMetadata | undefined;
+	const migrationGroup = { ...group, candidates: candidatesToMigrate };
+	const beforeWrite = async () => {
+		if (await options.isContextCurrent?.(candidatesToMigrate) === false) {
+			throw new McpServerMigrationError(McpServerCustomizationMigrationFailureReason.NoLongerEligible, new Error('MCP migration context changed before writing.'));
+		}
+	};
 	if (targetChanged) {
 		logService.trace(`${LOG_PREFIX} Writing target ${group.targetUri.toString()}.`);
 		try {
-			writtenTarget = await writeDocument(group.targetUri, targetContent, target, fileService);
+			writtenTarget = await writeDocument(group.targetUri, targetContent, target, fileService, beforeWrite);
 		} catch (error) {
+			if (error instanceof McpServerMigrationError) {
+				throw error;
+			}
 			throw new McpServerMigrationError(
 				error instanceof McpServerDocumentChangedError
 					? McpServerCustomizationMigrationFailureReason.TargetChanged
@@ -419,7 +428,7 @@ async function migrateGroup(
 	} catch (error) {
 		if (writtenTarget) {
 			try {
-				await rollbackTarget(group.targetUri, target, writtenTarget, targetContent, fileService);
+				await rollbackTarget(migrationGroup, target, writtenTarget, targetContent, fileService, logService);
 			} catch (rollbackError) {
 				throw rollbackErrorWith(error, rollbackError, group.sourceUri);
 			}
@@ -427,10 +436,10 @@ async function migrateGroup(
 		throw error;
 	}
 
-	if (options.isContextCurrent?.(candidatesToMigrate) === false) {
+	if (await options.isContextCurrent?.(candidatesToMigrate) === false) {
 		logService.trace(`${LOG_PREFIX} Aborting ${group.sourceUri.toString()} after the target write: execution context changed.`);
 		if (writtenTarget) {
-			await rollbackTarget(group.targetUri, target, writtenTarget, targetContent, fileService);
+			await rollbackTarget(migrationGroup, target, writtenTarget, targetContent, fileService, logService);
 		}
 		return {
 			migratedCount: 0,
@@ -441,10 +450,16 @@ async function migrateGroup(
 	let writtenSource: IFileStatWithMetadata;
 	logService.trace(`${LOG_PREFIX} Removing ${candidatesToMigrate.length} migrated entr${candidatesToMigrate.length === 1 ? 'y' : 'ies'} from ${group.sourceUri.toString()}.`);
 	try {
-		writtenSource = await writeDocument(group.sourceUri, sourceContent, source, fileService);
+		writtenSource = await writeDocument(group.sourceUri, sourceContent, source, fileService, beforeWrite);
 	} catch (error) {
 		const sourceChangedBeforeWrite = error instanceof McpServerDocumentChangedError;
-		if (!sourceChangedBeforeWrite) {
+		if (sourceChangedBeforeWrite && await isConcurrentMigrationComplete(migrationGroup, fileService)) {
+			await ensureNoCrossRootConflicts(migrationGroup, roots, fileService, logService);
+			logService.info(`${LOG_PREFIX} Concurrent migration already completed for ${group.sourceUri.toString()}; retaining ${group.targetUri.toString()}.`);
+			return { migratedCount: candidatesToMigrate.length, failures };
+		}
+		const contextChangedBeforeWrite = error instanceof McpServerMigrationError && error.reason === McpServerCustomizationMigrationFailureReason.NoLongerEligible;
+		if (!sourceChangedBeforeWrite && !contextChangedBeforeWrite) {
 			logService.trace(`${LOG_PREFIX} Source write failed; restoring ${group.sourceUri.toString()}.`);
 			try {
 				await restoreSourceAfterFailedWrite(group.sourceUri, source, sourceContent, fileService);
@@ -455,10 +470,13 @@ async function migrateGroup(
 		if (writtenTarget) {
 			logService.trace(`${LOG_PREFIX} Rolling back target ${group.targetUri.toString()}.`);
 			try {
-				await rollbackTarget(group.targetUri, target, writtenTarget, targetContent, fileService);
+				await rollbackTarget(migrationGroup, target, writtenTarget, targetContent, fileService, logService);
 			} catch (rollbackError) {
 				throw rollbackErrorWith(error, rollbackError, group.sourceUri);
 			}
+		}
+		if (contextChangedBeforeWrite) {
+			throw error;
 		}
 		throw new McpServerMigrationError(
 			sourceChangedBeforeWrite
@@ -483,7 +501,7 @@ async function migrateGroup(
 		}
 		if (sourceRestored && writtenTarget) {
 			try {
-				await rollbackTarget(group.targetUri, target, writtenTarget, targetContent, fileService);
+				await rollbackTarget(migrationGroup, target, writtenTarget, targetContent, fileService, logService);
 			} catch (error) {
 				rollbackErrors.push(toError(error));
 			}
@@ -502,6 +520,19 @@ async function migrateGroup(
 
 	logService.trace(`${LOG_PREFIX} Verified ${candidatesToMigrate.length} migrated server(s) from ${group.sourceUri.toString()}.`);
 	return { migratedCount: candidatesToMigrate.length, failures };
+}
+
+async function isConcurrentMigrationComplete(group: IMcpServerMigrationGroup, fileService: IFileService): Promise<boolean> {
+	try {
+		const sourceServers = getObjectProperty((await readSourceDocument(group.sourceUri, fileService)).value, 'servers');
+		const targetServers = getTargetServers(await readTargetDocument(group.targetUri, fileService));
+		return sourceServers !== undefined && group.candidates.every(candidate =>
+			!Object.hasOwn(sourceServers, candidate.name)
+			&& Object.hasOwn(targetServers, candidate.name)
+			&& equals(canonicalizeSourceConfiguration(targetServers[candidate.name]), canonicalizeConfiguration(candidate.projectedConfiguration)));
+	} catch {
+		return false;
+	}
 }
 
 async function restoreSourceAfterFailedWrite(resource: URI, original: IJsonDocument, attemptedContent: string, fileService: IFileService): Promise<void> {
@@ -591,19 +622,21 @@ function getTargetServers(target: IMcpTargetDocument): Record<string, unknown> {
 	return target.wrapped ? getObjectProperty(target.value, 'mcpServers')! : target.value;
 }
 
-async function writeDocument(resource: URI, content: string, document: IJsonDocument, fileService: IFileService): Promise<IFileStatWithMetadata> {
+async function writeDocument(resource: URI, content: string, document: IJsonDocument, fileService: IFileService, beforeWrite?: () => Promise<void>): Promise<IFileStatWithMetadata> {
 	if (document.exists) {
-		return writeExistingDocument(resource, content, document.content, fileService);
+		return writeExistingDocument(resource, content, document.content, fileService, beforeWrite);
 	}
+	await beforeWrite?.();
 	return fileService.createFile(resource, VSBuffer.fromString(content), { overwrite: false });
 }
 
-async function writeExistingDocument(resource: URI, content: string, expectedContent: string, fileService: IFileService): Promise<IFileStatWithMetadata> {
+async function writeExistingDocument(resource: URI, content: string, expectedContent: string, fileService: IFileService, beforeWrite?: () => Promise<void>): Promise<IFileStatWithMetadata> {
 	await ensureFileExists(resource, fileService);
 	const current = await fileService.readFile(resource);
 	if (current.value.toString() !== expectedContent) {
 		throw new McpServerDocumentChangedError(resource);
 	}
+	await beforeWrite?.();
 	return fileService.writeFile(resource, VSBuffer.fromString(content), {
 		etag: current.etag,
 		mtime: current.mtime,
@@ -625,12 +658,14 @@ async function restoreExistingDocument(
 }
 
 async function rollbackTarget(
-	resource: URI,
-	original: IJsonDocument,
+	group: IMcpServerMigrationGroup,
+	original: IMcpTargetDocument,
 	written: IFileStatWithMetadata,
 	writtenContent: string,
 	fileService: IFileService,
+	logService: ILogService,
 ): Promise<void> {
+	const resource = group.targetUri;
 	const current = await fileService.readFile(resource);
 	if (current.etag !== written.etag || current.mtime !== written.mtime || current.value.toString() !== writtenContent) {
 		throw new McpServerMigrationError(
@@ -639,7 +674,21 @@ async function rollbackTarget(
 		);
 	}
 	if (original.exists) {
-		await writeExistingDocument(resource, original.content, writtenContent, fileService);
+		const originalServers = getTargetServers(original);
+		const addedCandidates = group.candidates.filter(candidate => !Object.hasOwn(originalServers, candidate.name));
+		await writeExistingDocument(resource, original.content, writtenContent, fileService, async () => {
+			try {
+				const sourceServers = getObjectProperty((await readSourceDocument(group.sourceUri, fileService)).value, 'servers');
+				if (!sourceServers || addedCandidates.some(candidate =>
+					!Object.hasOwn(sourceServers, candidate.name)
+					|| !equals(canonicalizeSourceConfiguration(sourceServers[candidate.name]), canonicalizeConfiguration(candidate.projectedConfiguration)))) {
+					throw new Error(`Source ${group.sourceUri.toString()} no longer contains all entries added to ${resource.toString()}.`);
+				}
+			} catch (error) {
+				logService.warn(`${LOG_PREFIX} Retaining ${resource.toString()}: cannot verify surviving source entries in ${group.sourceUri.toString()}.`);
+				throw new McpServerMigrationError(McpServerCustomizationMigrationFailureReason.RollbackFailed, toError(error));
+			}
+		});
 	} else {
 		throw new McpServerMigrationError(
 			McpServerCustomizationMigrationFailureReason.RollbackFailed,

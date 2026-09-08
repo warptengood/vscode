@@ -4,6 +4,7 @@
  *--------------------------------------------------------------------------------------------*/
 
 import assert from 'assert';
+import { DeferredPromise } from '../../../../../../base/common/async.js';
 import { VSBuffer } from '../../../../../../base/common/buffer.js';
 import { parse } from '../../../../../../base/common/jsonc.js';
 import { Schemas } from '../../../../../../base/common/network.js';
@@ -132,6 +133,20 @@ class CrossRootConflictProvider extends InMemoryFileSystemProvider {
 		if (this.triggerUri && this.conflictingUri && isEqual(resource, this.triggerUri)) {
 			this.triggerUri = undefined;
 			await super.writeFile(this.conflictingUri, VSBuffer.fromString('{"mcpServers":{"demo":{"command":"other"}}}').buffer, options);
+		}
+	}
+}
+
+class InterleavedMigrationProvider extends InMemoryFileSystemProvider {
+	resource: URI | undefined;
+	afterWrite: (() => Promise<void>) | undefined;
+
+	override async writeFile(resource: URI, content: Uint8Array, options: IFileWriteOptions): Promise<void> {
+		await super.writeFile(resource, content, options);
+		if (this.resource && isEqual(resource, this.resource)) {
+			const afterWrite = this.afterWrite;
+			this.afterWrite = undefined;
+			await afterWrite?.();
 		}
 	}
 }
@@ -282,6 +297,159 @@ suite('McpServerCustomizationMigration', () => {
 			source: { servers: { conflict: { command: 'node' } } },
 		});
 	});
+
+	for (const existingTarget of [false, true]) {
+		test(`preserves a concurrent completed migration with ${existingTarget ? 'an existing' : 'a new'} target`, async () => {
+			const root = URI.file('/concurrent');
+			const selected = candidate(root, 'server');
+			const provider = new InterleavedMigrationProvider();
+			const firstWindow = createFileService(provider);
+			const secondWindow = store.add(new FileService(new NullLogService()));
+			store.add(secondWindow.registerProvider(Schemas.file, provider));
+			await firstWindow.writeFile(selected.sourceUri, VSBuffer.fromString('{"servers":{"server":{"command":"node"}}}'));
+			if (existingTarget) {
+				await firstWindow.writeFile(selected.targetUri, VSBuffer.fromString('{"mcpServers":{}}'));
+			}
+			let peerMigratedCount = 0;
+			provider.resource = selected.targetUri;
+			provider.afterWrite = async () => {
+				peerMigratedCount = (await createMigrator(secondWindow).migrate([selected])).migratedCount;
+			};
+			const messages: string[] = [];
+			const logService = new class extends NullLogService {
+				override info(message: string): void { messages.push(message); }
+			}();
+
+			const result = await new McpServerCustomizationMigrator(firstWindow, logService).migrate([selected]);
+
+			assert.deepStrictEqual({
+				result,
+				peerMigratedCount,
+				source: parse((await firstWindow.readFile(selected.sourceUri)).value.toString()),
+				target: parse((await firstWindow.readFile(selected.targetUri)).value.toString()),
+				messages,
+			}, {
+				result: { migratedCount: 1, failures: [] },
+				peerMigratedCount: 1,
+				source: { servers: {} },
+				target: { mcpServers: { server: { type: 'stdio', command: 'node' } } },
+				messages: [`[MCP Customization Migration] Concurrent migration already completed for ${selected.sourceUri.toString()}; retaining ${selected.targetUri.toString()}.`],
+			});
+		});
+	}
+
+	for (const cause of ['partial peer completion', 'context change'] as const) {
+		test(`retains the surviving target copy after ${cause}`, async () => {
+			const root = URI.file('/retain-peer');
+			const first = candidate(root, 'first');
+			const second = candidate(root, 'second');
+			const provider = new InterleavedMigrationProvider();
+			const firstWindow = createFileService(provider);
+			const secondWindow = store.add(new FileService(new NullLogService()));
+			store.add(secondWindow.registerProvider(Schemas.file, provider));
+			await firstWindow.writeFile(first.sourceUri, VSBuffer.fromString('{"servers":{"first":{"command":"node"},"second":{"command":"node"}}}'));
+			await firstWindow.writeFile(first.targetUri, VSBuffer.fromString('{"mcpServers":{}}'));
+			let isCurrent = true;
+			let peerMigratedCount = 0;
+			provider.resource = first.targetUri;
+			provider.afterWrite = async () => {
+				peerMigratedCount = (await createMigrator(secondWindow).migrate(cause === 'context change' ? [first, second] : [first])).migratedCount;
+				isCurrent = cause !== 'context change';
+			};
+
+			const result = await createMigrator(firstWindow).migrate([first, second], { isContextCurrent: async () => isCurrent });
+
+			assert.deepStrictEqual({
+				migratedCount: result.migratedCount,
+				failures: result.failures.map(failure => failure.reason),
+				peerMigratedCount,
+				source: parse((await firstWindow.readFile(first.sourceUri)).value.toString()),
+				target: parse((await firstWindow.readFile(first.targetUri)).value.toString()),
+			}, {
+				migratedCount: 0,
+				failures: [McpServerCustomizationMigrationFailureReason.RollbackFailed, McpServerCustomizationMigrationFailureReason.RollbackFailed],
+				peerMigratedCount: cause === 'context change' ? 2 : 1,
+				source: { servers: cause === 'context change' ? {} : { second: { command: 'node' } } },
+				target: { mcpServers: { first: { type: 'stdio', command: 'node' }, second: { type: 'stdio', command: 'node' } } },
+			});
+		});
+	}
+
+	test('checks only newly added target entries when rolling back after a peer migration', async () => {
+		const root = URI.file('/preexisting-peer');
+		const first = candidate(root, 'first');
+		const second = candidate(root, 'second');
+		const provider = new InterleavedMigrationProvider();
+		const firstWindow = createFileService(provider);
+		const secondWindow = store.add(new FileService(new NullLogService()));
+		store.add(secondWindow.registerProvider(Schemas.file, provider));
+		await firstWindow.writeFile(first.sourceUri, VSBuffer.fromString('{"servers":{"first":{"command":"node"},"second":{"command":"node"}}}'));
+		const targetContent = '{"mcpServers":{"first":{"command":"node"}}}';
+		await firstWindow.writeFile(first.targetUri, VSBuffer.fromString(targetContent));
+		provider.resource = first.targetUri;
+		provider.afterWrite = async () => { await createMigrator(secondWindow).migrate([first]); };
+
+		const result = await createMigrator(firstWindow).migrate([first, second]);
+
+		assert.deepStrictEqual({
+			failures: result.failures.map(failure => failure.reason),
+			source: parse((await firstWindow.readFile(first.sourceUri)).value.toString()),
+			target: (await firstWindow.readFile(first.targetUri)).value.toString(),
+		}, {
+			failures: [McpServerCustomizationMigrationFailureReason.SourceChanged, McpServerCustomizationMigrationFailureReason.SourceChanged],
+			source: { servers: { second: { command: 'node' } } },
+			target: targetContent,
+		});
+	});
+
+	for (const phase of ['target', 'source'] as const) {
+		test(`awaits the final context guard after reading the ${phase} file`, async () => {
+			const root = URI.file('/final-guard');
+			const selected = candidate(root, 'server');
+			const readCompleted = new DeferredPromise<void>();
+			const guardReleased = new DeferredPromise<boolean>();
+			let checking = false;
+			let reads = 0;
+			const writes: string[] = [];
+			const provider = new class extends InMemoryFileSystemProvider {
+				override async readFile(resource: URI): Promise<Uint8Array> {
+					const content = await super.readFile(resource);
+					if (checking && isEqual(resource, phase === 'target' ? selected.targetUri : selected.sourceUri) && ++reads === 2) {
+						readCompleted.complete();
+					}
+					return content;
+				}
+				override async writeFile(resource: URI, content: Uint8Array, options: IFileWriteOptions): Promise<void> {
+					if (checking) { writes.push(resource.path); }
+					await super.writeFile(resource, content, options);
+				}
+			}();
+			const fileService = createFileService(provider);
+			const sourceContent = '{"servers":{"server":{"command":"node"}}}';
+			const targetContent = '{"mcpServers":{}}';
+			await fileService.writeFile(selected.sourceUri, VSBuffer.fromString(sourceContent));
+			await fileService.writeFile(selected.targetUri, VSBuffer.fromString(targetContent));
+			checking = true;
+
+			const pending = createMigrator(fileService).migrate([selected], { isContextCurrent: () => readCompleted.isSettled ? guardReleased.p : true });
+			await readCompleted.p;
+			const writesBeforeRelease = [...writes];
+			guardReleased.complete(false);
+			const result = await pending;
+
+			assert.deepStrictEqual({
+				writesBeforeRelease,
+				failures: result.failures.map(failure => failure.reason),
+				source: (await fileService.readFile(selected.sourceUri)).value.toString(),
+				target: (await fileService.readFile(selected.targetUri)).value.toString(),
+			}, {
+				writesBeforeRelease: phase === 'target' ? [] : [selected.targetUri.path],
+				failures: [McpServerCustomizationMigrationFailureReason.NoLongerEligible],
+				source: sourceContent,
+				target: targetContent,
+			});
+		});
+	}
 
 	test('rejects changed source configuration and invalid targets without writes', async () => {
 		const root = URI.file('/invalid');

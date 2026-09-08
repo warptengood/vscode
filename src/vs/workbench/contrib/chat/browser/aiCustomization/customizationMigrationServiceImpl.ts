@@ -23,6 +23,7 @@ import { IPromptsService, PromptsStorage } from '../../common/promptSyntax/servi
 import { IAgentHostActiveClientService } from '../agentSessions/agentHost/agentHostActiveClientService.js';
 import { IAgentHostCustomizationService } from '../agentSessions/agentHost/agentHostCustomizationService.js';
 import { AgentHostMcpServerApplicability, IAgentHostMcpServerSupportSnapshot } from '../agentSessions/agentHost/agentHostMcpServerSupport.js';
+import { IAgentHostMcpServerSupportScope } from '../agentSessions/agentHost/agentHostMcpServerSupportScope.js';
 import { isMcpServerMigrationDeliverable, McpServerCustomizationMigrator } from './mcpServerCustomizationMigration.js';
 
 export class CustomizationMigrationService extends Disposable implements ICustomizationMigrationService {
@@ -114,18 +115,24 @@ export class CustomizationMigrationService extends Disposable implements ICustom
 		}
 
 		try {
-			await scope.whenResolved();
+			if (!await this.waitForMcpServerSupport(scope)) {
+				return { migratedCount: 0, failures: requestedCandidates.map(candidate => this.noLongerEligible(candidate)) };
+			}
 			if (!this.isExecutionContextCurrent(sessionResource, roots, contextGeneration)) {
 				return { migratedCount: 0, failures: requestedCandidates.map(candidate => this.noLongerEligible(candidate)) };
 			}
 
 			const supportSnapshot = scope.support.get();
 			const plan = await this.mcpServerMigration.createPlan(supportSnapshot, roots);
-			const isExecutionCurrent = (candidates: readonly IMcpServerCustomizationMigrationCandidate[]): boolean =>
-				this.isExecutionContextCurrent(sessionResource, roots, contextGeneration)
-				&& scope.isResolved.get()
-				&& this.isMcpSupportContextCurrent(scope.support.get(), supportSnapshot, candidates);
-			if (!isExecutionCurrent(plan.candidates)) {
+			const isExecutionCurrent = async (candidates: readonly IMcpServerCustomizationMigrationCandidate[]): Promise<boolean> => {
+				if (!await this.waitForMcpServerSupport(scope)) {
+					return false;
+				}
+				return this.isExecutionContextCurrent(sessionResource, roots, contextGeneration)
+					&& scope.isResolved.get()
+					&& this.isMcpSupportContextCurrent(scope.support.get(), supportSnapshot, candidates);
+			};
+			if (!await isExecutionCurrent(plan.candidates)) {
 				return { migratedCount: 0, failures: requestedCandidates.map(candidate => this.noLongerEligible(candidate)) };
 			}
 
@@ -252,20 +259,22 @@ export class CustomizationMigrationService extends Disposable implements ICustom
 		}
 
 		try {
-			await raceCancellation(scope.whenResolved(), token);
-			if (token.isCancellationRequested || !this.areRootsEqual(roots, this.agentHostCustomizationService.getClientWorkingDirectoryUris(sessionResource))) {
+			if (!await this.waitForMcpServerSupport(scope, token) || !this.areRootsEqual(roots, this.agentHostCustomizationService.getClientWorkingDirectoryUris(sessionResource))) {
 				return this.emptyMcpServerMigration();
 			}
 			const snapshot = scope.support.get();
 			const candidates = this.isMigrationEnabled(CustomizationMigrationType.McpServers)
 				? (await this.mcpServerMigration.createPlan(snapshot, roots)).candidates
 				: [];
-			if (token.isCancellationRequested || !this.areRootsEqual(roots, this.agentHostCustomizationService.getClientWorkingDirectoryUris(sessionResource))) {
+			if (!await this.waitForMcpServerSupport(scope, token)
+				|| !this.areRootsEqual(roots, this.agentHostCustomizationService.getClientWorkingDirectoryUris(sessionResource))
+				|| !this.isMcpSupportContextCurrent(scope.support.get(), snapshot, candidates)) {
 				return this.emptyMcpServerMigration();
 			}
+			const settledSnapshot = scope.support.get();
 			return {
 				type: CustomizationMigrationType.McpServers,
-				servers: snapshot.servers
+				servers: settledSnapshot.servers
 					.filter(server => server.applicability !== AgentHostMcpServerApplicability.OutsideCurrentScope)
 					.map(server => ({
 						id: server.id,
@@ -273,8 +282,8 @@ export class CustomizationMigrationService extends Disposable implements ICustom
 						supported: server.compatibility.kind === 'supported',
 					})),
 				candidates: this.isMigrationEnabled(CustomizationMigrationType.McpServers) ? candidates : [],
-				discoveryComplete: snapshot.discoveryComplete,
-				coverage: snapshot.coverage,
+				discoveryComplete: settledSnapshot.discoveryComplete,
+				coverage: settledSnapshot.coverage,
 			};
 		} finally {
 			scope.dispose();
@@ -303,6 +312,11 @@ export class CustomizationMigrationService extends Disposable implements ICustom
 
 	private isMigrationEnabled(type: CustomizationMigrationType): boolean {
 		return this.configurationService.getValue<boolean>(getCustomizationMigrationEnablementSetting(type)) === true;
+	}
+
+	private async waitForMcpServerSupport(scope: IAgentHostMcpServerSupportScope, token = CancellationToken.None): Promise<boolean> {
+		await raceCancellation(scope.whenResolved(), token);
+		return !token.isCancellationRequested && scope.isResolved.get();
 	}
 
 	/**
