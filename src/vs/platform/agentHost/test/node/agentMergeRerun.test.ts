@@ -102,6 +102,42 @@ suite('Agent Merge workflow reruns', () => {
 		});
 	}));
 
+	test('suppresses a newly deferred failure during the same turn without revoking its rerun authorization', () => withController(async h => {
+		h.mutations.jobs = [{ id: 'mac-job', checkRunId: 'mac', runId: '1', name: 'macOS', conclusion: 'FAILURE' }];
+		await h.tools.rerunFailedWorkflow(h.session, '1', true);
+		const details = await h.tools.readFailedCI(h.session);
+		const repeated = await h.tools.rerunFailedWorkflow(h.session, '1', true);
+
+		assert.deepStrictEqual({
+			details,
+			annotationIds: h.mutations.annotationIds,
+			logIds: h.mutations.logIds,
+			repeatedOutcome: JSON.parse(repeated).outcome,
+			reruns: h.mutations.reruns,
+		}, {
+			details: 'No failed required CI details are available.',
+			annotationIds: [],
+			logIds: [],
+			repeatedOutcome: 'deferred',
+			reruns: [],
+		});
+	}));
+
+	test('does not authorize deferred failures from previous turns when a different workflow fails', () => withController(async h => {
+		await h.tools.rerunFailedWorkflow(h.session, '1', true);
+		await h.completeTurn();
+		h.snapshot.set(readySnapshot([
+			check('mac', 'macOS', 'COMPLETED', 'FAILURE'),
+			check('windows', 'Windows', 'COMPLETED', 'FAILURE', '2'),
+		]), undefined);
+		h.mutations.runs.push({ id: '2', name: 'Windows CI', headSha: 'head', runAttempt: 1, status: 'IN_PROGRESS' });
+		await timeout(31_000);
+
+		await assert.rejects(h.tools.rerunFailedWorkflow(h.session, '1', true), /not associated with a failed required check/);
+		const result = await h.tools.rerunFailedWorkflow(h.session, '2', true);
+		assert.strictEqual(JSON.parse(result).outcome, 'deferred');
+	}));
+
 	test('diagnoses newly failed sibling jobs without reading the deferred failure again', () => withController(async h => {
 		await h.tools.rerunFailedWorkflow(h.session, '1', true);
 		await h.completeTurn();

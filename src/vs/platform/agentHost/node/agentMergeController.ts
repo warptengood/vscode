@@ -575,7 +575,16 @@ export class AgentMergeController extends Disposable {
 					signal: runtime.abortController.signal,
 					commentWatermark: gate.context.commentWatermark,
 					deferredCheckIds,
-					deferWorkflowRerun: (options, checkIds, running) => this._deferWorkflowRerun(context, runtime, options, checkIds, running),
+					initialDeferredCheckIds: new Set(deferredCheckIds),
+					deferWorkflowRerun: (options, checkIds, running) => {
+						const deferred = this._deferWorkflowRerun(context, runtime, options, checkIds, running);
+						if (deferred) {
+							for (const id of checkIds) {
+								deferredCheckIds.add(id);
+							}
+						}
+						return deferred;
+					},
 				};
 				if (!this._isCurrentRuntime(session, runtime)
 					|| !this._isTargetStillCurrent(session, target)
@@ -638,7 +647,7 @@ export class AgentMergeController extends Disposable {
 		return true;
 	}
 
-	private _pruneDeferredWorkflowReruns(session: string, runtime: AgentMergeRuntime, snapshot: PullRequestSnapshot): ReadonlySet<string> {
+	private _pruneDeferredWorkflowReruns(session: string, runtime: AgentMergeRuntime, snapshot: PullRequestSnapshot): Set<string> {
 		const headSha = snapshot.core.value?.headSha;
 		const checks = snapshot.checks.status === 'ready' && snapshot.checks.complete && snapshot.checks.value?.headSha && snapshot.checks.value.headSha === headSha
 			? classifyAgentMergeRequiredChecks(snapshot.checks.value) : undefined;

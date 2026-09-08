@@ -21,6 +21,8 @@ export interface IAgentMergeTurnContext {
 	readonly signal: AbortSignal;
 	readonly commentWatermark: string;
 	readonly deferredCheckIds: ReadonlySet<string>;
+	/** Keeps rerun authorization stable when diagnostics are suppressed mid-turn. */
+	readonly initialDeferredCheckIds: ReadonlySet<string>;
 	/** Defers a busy workflow or coalesces with a rerun the host is already handling. */
 	readonly deferWorkflowRerun: (options: GitHubWorkflowRerunOptions, checkIds: readonly string[], running: boolean) => boolean;
 }
@@ -98,7 +100,7 @@ export class AgentMergeTools implements IAgentMergeToolAccessor {
 
 	async rerunFailedWorkflow(session: string, runId: string, failedJobsOnly: boolean): Promise<string> {
 		const context = this._requireTurnAction(session, 'fixCI');
-		const failedChecks = failedRequiredChecks(context).filter(check => workflowRunId(check) === runId);
+		const failedChecks = failedRequiredChecks(context, context.initialDeferredCheckIds).filter(check => workflowRunId(check) === runId);
 		if (failedChecks.length === 0) {
 			throw new Error('The workflow run is not associated with a failed required check in this Agent Merge turn.');
 		}
@@ -144,9 +146,9 @@ export class AgentMergeTools implements IAgentMergeToolAccessor {
 	}
 }
 
-function failedRequiredChecks(context: IAgentMergeTurnContext): readonly PullRequestCheck[] {
+function failedRequiredChecks(context: IAgentMergeTurnContext, deferredCheckIds = context.deferredCheckIds): readonly PullRequestCheck[] {
 	const checks = context.snapshot.checks.value ? classifyAgentMergeRequiredChecks(context.snapshot.checks.value) : undefined;
-	return checks?.kind === 'ready' ? checks.failed.filter(check => !context.deferredCheckIds.has(check.id)) : [];
+	return checks?.kind === 'ready' ? checks.failed.filter(check => !deferredCheckIds.has(check.id)) : [];
 }
 
 function workflowRunId(check: PullRequestCheck): string | undefined {
