@@ -683,7 +683,6 @@ export class CopilotSessionLauncher implements ICopilotSessionLauncher {
 		const raw = await this._withTraceContext(plan.sessionId, () => plan.client.createSession({
 			...config,
 			sessionId: plan.sessionId,
-			streaming: true,
 			model: plan.model?.id,
 			reasoningEffort: resolveCopilotReasoningEffort(plan.model, this._configurationService, this._logService, plan.sessionId),
 			contextTier: getCopilotContextTier(plan.model, plan.longContextWindow, plan.freeLongContext),
@@ -983,6 +982,7 @@ export class CopilotSessionLauncher implements ICopilotSessionLauncher {
 			...byok,
 			...disabledMcpServers,
 			clientName: AGENT_HOST_COPILOT_CLIENT_NAME,
+			streaming: true,
 			// Resume only: `_createSession` re-resolves the full effort for a create,
 			// while a resumed session keeps the effort the runtime journaled unless
 			// an override is configured.
