@@ -152,6 +152,7 @@ interface IMcpAuthToolCall {
 }
 
 interface ICopilotActiveToolCall {
+	readonly turnId: string;
 	readonly toolName: string;
 	readonly displayName: string;
 	readonly parameters: Record<string, unknown> | undefined;
@@ -5085,6 +5086,7 @@ export class CopilotAgentSession extends Disposable {
 			const contributor = this._getToolCallContributor(e.data.toolName, e.data.mcpServerName);
 			const intention = getShellIntention(e.data.toolName, parameters);
 			this._activeToolCalls.set(e.data.toolCallId, {
+				turnId: this._turnId,
 				toolName: e.data.toolName,
 				displayName,
 				parameters,
@@ -5308,7 +5310,7 @@ export class CopilotAgentSession extends Disposable {
 			const filePaths = isEditTool(tracked.toolName, command) ? this._getEditFilePaths(tracked.parameters) : [];
 			for (const filePath of filePaths) {
 				try {
-					const fileEdit = await this._editTracker.takeCompletedEdit(this._turnId, e.data.toolCallId, filePath, tracked.toolName, tracked.parameters, this._lastSeenModelId, this._currentTurn.value?.clientContext);
+					const fileEdit = await this._editTracker.takeCompletedEdit(tracked.turnId, e.data.toolCallId, filePath, tracked.toolName, tracked.parameters, this._lastSeenModelId, this._currentTurn.value?.clientContext);
 					if (fileEdit) {
 						content.push(fileEdit);
 					}
@@ -5319,7 +5321,7 @@ export class CopilotAgentSession extends Disposable {
 
 			this._emitAction({
 				type: ActionType.ChatToolCallComplete,
-				turnId: this._turnId,
+				turnId: tracked.turnId,
 				toolCallId: e.data.toolCallId,
 				result: {
 					success: e.data.success,
