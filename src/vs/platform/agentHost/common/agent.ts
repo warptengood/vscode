@@ -27,6 +27,16 @@ export class AgentHostStartError extends Error {
 	}
 }
 
+/** Reports a provider CWD error after the new directory became irreversible and authoritative. */
+export class AgentWorkingDirectoryChangedError extends Error {
+	constructor(
+		readonly workingDirectory: URI,
+		message: string,
+	) {
+		super(message);
+	}
+}
+
 export function isInvalidUtilityProcessConfigurationMessage(message: string): boolean {
 	return /^Invalid value for (?:args|env|execArgv)$/.test(message);
 }
@@ -85,13 +95,15 @@ export interface IAgentHostNetworkEndpoint {
 
 export interface IAgentHostManagedSettingsSnapshot {
 	readonly account?: string;
-	readonly source: 'server' | 'device' | 'client' | 'mixed' | 'none';
+	readonly source: 'server' | 'device' | 'client' | 'policyHelper' | 'mixed' | 'none';
 	readonly serverManaged: boolean;
 	readonly deviceManaged: boolean;
 	readonly clientManaged?: boolean;
+	readonly policyHelperManaged?: boolean;
 	readonly failClosed: boolean;
 	readonly bypassPermissionsDisabled: boolean;
 	readonly permissionsAllowIntersected?: boolean;
+	readonly sandboxEnabledByUndeterminedPolicy?: boolean;
 	readonly managedKeys: readonly string[];
 	readonly settings?: unknown;
 }
@@ -248,6 +260,11 @@ export const CODEX_AGENT_PROVIDER_ID = 'codex' as const;
  * so a new flag added in one place is automatically reflected in the other.
  */
 export type IAgentCapabilities = AgentCapabilities;
+
+/** Agent Host-only capabilities that are not serialized to protocol clients. */
+export interface IAgentHostCapabilities {
+	readonly workspaceConversion: boolean;
+}
 
 /** Metadata describing an agent backend, discovered over IPC. */
 export interface IAgentDescriptor {
@@ -448,6 +465,8 @@ export interface IAgentChatContext {
 	readonly customizations?: readonly Customization[];
 	/** Per-operation host instructions that providers add to model context without persisting as user content. */
 	readonly hostInstructions?: readonly string[];
+	/** Whether the current turn is an automated Agent Merge repair turn. */
+	readonly agentMergeTurn?: boolean;
 }
 
 export type AgentChatOperationContext = URI | IAgentChatContext;
@@ -877,7 +896,7 @@ export interface IAgentToolPendingConfirmationSignal {
 	/** Protocol-shaped pending-confirmation state, dispatched verbatim into `ChatToolCallReady`. */
 	readonly state: ToolCallPendingConfirmationState;
 	/** Host-only auto-approval kind (not part of the dispatched action). */
-	readonly permissionKind?: 'shell' | 'write' | 'mcp' | 'read' | 'url' | 'skill' | 'custom-tool' | 'hook' | 'memory' | 'factory' | 'extension-management' | 'extension-permission-access';
+	readonly permissionKind?: 'shell' | 'write' | 'mcp' | 'read' | 'url' | 'skill' | 'custom-tool' | 'hook' | 'memory' | 'factory' | 'extension-management' | 'extension-permission-access' | 'extension-env-access';
 	/** Host-only auto-approval path target (not part of the dispatched action). */
 	readonly permissionPath?: string;
 	/**
@@ -907,6 +926,8 @@ export interface IAgentToolPendingConfirmationSignal {
 	readonly parentToolCallId?: string;
 }
 
+export type AgentSubagentTaskModelSource = 'task_argument' | 'subagent_configuration' | 'custom_agent_definition' | 'unset';
+
 /**
  * A subagent was spawned by a tool call. The host creates a child session
  * silently and routes subsequent inner-tool events to it.
@@ -921,6 +942,7 @@ export interface IAgentSubagentStartedSignal {
 	readonly agentName: string;
 	readonly agentDisplayName: string;
 	readonly agentDescription?: string;
+	readonly taskModelSource?: AgentSubagentTaskModelSource;
 	/**
 	 * The spawning Task tool's short (typically 3-5 word) `description`
 	 * input, e.g. "Review package.json structure". Distinct from
@@ -1106,6 +1128,9 @@ export interface IAgent {
 	/** Unique provider identifier. */
 	readonly id: AgentProvider;
 
+	/** Capabilities consumed only inside the Agent Host process. */
+	readonly agentHostCapabilities: IAgentHostCapabilities;
+
 	/** Provider descriptor and capabilities. */
 	getDescriptor(): IAgentDescriptor;
 
@@ -1141,8 +1166,19 @@ export interface IAgent {
 	/** Optional history mutation for providers with a native truncation operation. */
 	truncateChat?(chat: URI, turnId: string | undefined, context?: URI | IAgentChatContext): Promise<void>;
 
+	/**
+	 * Changes the working directory of an exact chat's existing provider-native
+	 * backing. Callers MUST gate this operation on
+	 * {@link IAgentHostCapabilities.workspaceConversion}; implementations that do
+	 * not advertise the capability MUST reject the call.
+	 */
+	setWorkingDirectory(chat: URI, context: URI | IAgentChatContext, workingDirectory: URI): Promise<void>;
+
 	/** Return bounded diagnostics for an in-flight turn when supported. */
 	getTurnDiagnosticSnapshot?(chat: URI, turnId: string): IAgentTurnDiagnosticSnapshot | undefined;
+
+	/** Record the host-remapped turn for a completed provider model call. */
+	recordModelCallTurnCorrelation?(chat: URI, modelCallId: string, turnId: string): void;
 
 	// ---- Active clients and interaction ------------------------------------
 
@@ -1203,6 +1239,9 @@ export interface IAgent {
 	/** Provides chats that are ready to be registered as Agent Host sessions. */
 	readonly onDidDiscoverChats: Event<readonly IAgentDiscoveredChat[]>;
 
+	/** Starts the provider's memoized native chat discovery pass. */
+	startChatDiscovery?(): Promise<void>;
+
 	/** Lets discovery drop registered candidates before per-session I/O. */
 	setKnownSessionsFilter?(filter: IAgentKnownSessionsFilter): void;
 
@@ -1221,6 +1260,16 @@ export interface IAgent {
 	listLegacyChatBackings?(configurationResource: URI): Promise<readonly IAgentLegacyChat[]>;
 
 	// ---- Metadata -----------------------------------------------------------
+
+	/**
+	 * Warms a short-lived, in-memory cache of per-session metadata from a single
+	 * bulk provider call, so a subsequent burst of {@link getChatMetadata} calls
+	 * (e.g. a `listSessions` pass over a large catalogue) can be served without
+	 * one provider round-trip per session. Returns a disposable that clears the
+	 * cache; callers dispose it once the burst is complete. Optional: providers
+	 * without a cheap bulk read simply omit it and pay per session.
+	 */
+	prewarmSessionMetadata?(): Promise<IDisposable>;
 
 	/** Retrieve metadata for an exact registered chat. Ambient catalogue reads never set {@link IAgentChatMetadataOptions.activation}. */
 	getChatMetadata(chat: URI, context: URI | IAgentChatContext, providerData?: string, options?: IAgentChatMetadataOptions): Promise<IAgentChatMetadata | undefined>;
